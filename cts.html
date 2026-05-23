@@ -66,7 +66,10 @@
         "reactflow": "https://esm.sh/reactflow@11.11.4?deps=react@18.2.0,react-dom@18.2.0",
         "@emotion/css": "https://esm.sh/@emotion/css@11.11.2",
         "ai": "https://esm.sh/ai@3.4.33",
-        "@ai-sdk/openai": "https://esm.sh/@ai-sdk/openai@0.0.72?deps=ai@3.4.33"
+        "@ai-sdk/openai": "https://esm.sh/@ai-sdk/openai@0.0.72?deps=ai@3.4.33",
+        "@opentelemetry/api": "https://esm.sh/@opentelemetry/api@1.9.0",
+        "@opentelemetry/sdk-trace-base": "https://esm.sh/@opentelemetry/sdk-trace-base@1.26.0?deps=@opentelemetry/api@1.9.0",
+        "@opentelemetry/resources": "https://esm.sh/@opentelemetry/resources@1.26.0?deps=@opentelemetry/api@1.9.0"
       }
     }
     </script>
@@ -77,6 +80,30 @@ import { css } from '@emotion/css';
 import ReactFlow, { Background, BackgroundVariant, Controls, Handle, MarkerType, Position } from 'reactflow';
 import { generateText } from 'ai';
 import { createOpenAI } from '@ai-sdk/openai';
+import { trace as otelTrace, context as otelContext, SpanStatusCode } from '@opentelemetry/api';
+import { BasicTracerProvider, SimpleSpanProcessor } from '@opentelemetry/sdk-trace-base';
+import { Resource } from '@opentelemetry/resources';
+
+// ===================== OpenTelemetry setup =====================
+
+class LiveSpanProcessor {
+  constructor(onStart, onEnd) { this.onStartCb = onStart; this.onEndCb = onEnd; }
+  onStart(span) { this.onStartCb(span); }
+  onEnd(span) { this.onEndCb(span); }
+  shutdown() { return Promise.resolve(); }
+  forceFlush() { return Promise.resolve(); }
+}
+
+function setupOtel(onStart, onEnd) {
+  const provider = new BasicTracerProvider({
+    resource: new Resource({ 'service.name': 'cts' }),
+  });
+  provider.addSpanProcessor(new LiveSpanProcessor(onStart, onEnd));
+  provider.register();
+  const tracer = provider.getTracer('cts');
+  window.__ctsTracer = tracer;
+  return tracer;
+}
 
 // ===================== simulation engine =====================
 
@@ -135,7 +162,14 @@ class IndexedDbSink {
 }
 
 class TraceLog {
-  constructor() { this.entries = []; this.listeners = []; this.sink = undefined; }
+  constructor() {
+    this.entries = [];
+    this.listeners = [];
+    this.sink = undefined;
+    this.otelSpans = [];
+    this.otelById = new Map();
+    this.otelEvents = [];
+  }
   setSink(sink) { this.sink = sink; }
   getSink() { return this.sink; }
   record(entry) {
@@ -143,7 +177,46 @@ class TraceLog {
     if (this.sink) this.sink.append(entry);
     for (const l of this.listeners) l(entry);
   }
+  recordOtelStart(span) {
+    const sc = span.spanContext();
+    const parentSpanId = span.parentSpanId ?? span.parentSpanContext?.spanId;
+    const entry = {
+      kind: 'otel',
+      traceId: sc.traceId,
+      spanId: sc.spanId,
+      parentSpanId,
+      name: span.name,
+      startTimeMs: span.startTime ? span.startTime[0] * 1000 + span.startTime[1] / 1e6 : Date.now(),
+      endTimeMs: null,
+      attributes: { ...(span.attributes ?? {}) },
+      status: 'pending',
+      order: this.otelSpans.length,
+    };
+    this.otelById.set(sc.spanId, entry);
+    this.otelSpans.push(entry);
+    this.entries.push(entry);
+    this.otelEvents.push({ type: 'start', spanId: sc.spanId, timeMs: entry.startTimeMs });
+    if (this.sink) this.sink.append({ ...entry, event: 'start' });
+    for (const l of this.listeners) l(entry);
+  }
+  recordOtelEnd(span) {
+    const sc = span.spanContext();
+    const existing = this.otelById.get(sc.spanId);
+    const endTimeMs = span.endTime ? span.endTime[0] * 1000 + span.endTime[1] / 1e6 : Date.now();
+    const status = span.status?.code === SpanStatusCode.ERROR ? 'error' : 'ok';
+    const attributes = { ...(span.attributes ?? {}) };
+    if (existing) {
+      existing.endTimeMs = endTimeMs;
+      existing.status = status;
+      existing.attributes = attributes;
+    }
+    this.otelEvents.push({ type: 'end', spanId: sc.spanId, timeMs: endTimeMs });
+    if (this.sink) this.sink.append({ kind: 'otel', event: 'end', spanId: sc.spanId, endTimeMs, status, attributes });
+    for (const l of this.listeners) l(existing);
+  }
   all() { return this.entries.slice(); }
+  otel() { return this.otelSpans.slice(); }
+  events() { return this.otelEvents.slice(); }
   subscribe(listener) { this.listeners.push(listener); }
 }
 
@@ -183,6 +256,8 @@ class Simulation {
     this.queueListeners = [];
     this.drainScheduled = false;
     this.handlingStack = [];
+    this.tracer = null;
+    this.pendingExchanges = new Map();
   }
   tick() { this.clock += 1; }
   register(service) {
@@ -294,7 +369,12 @@ class UserService extends Service {
   }
   userChat(text) {
     this.setState({ lastChat: text });
-    this.send('LLM', 'chat', { text });
+    const tracer = this.sim.tracer;
+    const exchangeSpan = tracer.startSpan('chat.exchange', { attributes: { 'chat.message': text } });
+    const exchangeCtx = otelTrace.setSpan(otelContext.active(), exchangeSpan);
+    const sendSpan = tracer.startSpan('chat.send', { attributes: { 'chat.from': 'User', 'chat.to': 'LLM', 'chat.message': text } }, exchangeCtx);
+    sendSpan.end();
+    this.send('LLM', 'chat', { text, exchangeCtx, exchangeSpan });
   }
   handle(message) {
     if (message.type === 'chat_result') {
@@ -309,33 +389,39 @@ class LLMService extends Service {
   }
   handle(message) {
     if (message.type === 'chat') {
-      const { text } = message.payload;
-      this.callLlm(text, message.traceId);
+      const { text, exchangeCtx, exchangeSpan } = message.payload;
+      this.callLlm(text, message.traceId, exchangeCtx, exchangeSpan);
     }
   }
 
-  callLlm(text, traceId) {
+  callLlm(text, traceId, exchangeCtx, exchangeSpan) {
     const apiKey = window.VITE_OPENAI_API_KEY || '';
     const openai = createOpenAI({ apiKey });
     const prompt = text;
     const model = 'gpt-4o-mini';
-    const span = this.sim.startSpan({
-      traceId,
-      name: 'conductor.llm.reply',
-      service: this.name,
-      spanKind: 'llm',
-      attributes: { model, promptChars: prompt.length },
-    });
+    const tracer = this.sim.tracer;
+    const parentCtx = exchangeCtx ?? otelContext.active();
     generateText({ model: openai(model), prompt })
       .then((result) => {
-        span.end({ status: 'ok', attributes: { responseChars: result.text.length } });
-        this.send('User', 'chat_result', { text: result.text }, traceId, span.spanId);
+        const recvSpan = tracer.startSpan('chat.receive', { attributes: { 'chat.from': 'LLM', 'chat.to': 'User', 'chat.message': result.text } }, parentCtx);
+        recvSpan.end();
+        if (exchangeSpan) {
+          exchangeSpan.setAttribute('chat.response', result.text);
+          exchangeSpan.end();
+        }
+        this.send('User', 'chat_result', { text: result.text }, traceId);
         this.sim.scheduleDrain();
       })
       .catch((error) => {
         const msg = error instanceof Error ? error.message : String(error);
-        span.end({ status: 'error', error: msg });
-        this.send('User', 'chat_result', { error: msg }, traceId, span.spanId);
+        const recvSpan = tracer.startSpan('chat.receive', { attributes: { 'chat.from': 'LLM', 'chat.to': 'User', 'chat.error': msg } }, parentCtx);
+        recvSpan.setStatus({ code: SpanStatusCode.ERROR, message: msg });
+        recvSpan.end();
+        if (exchangeSpan) {
+          exchangeSpan.setStatus({ code: SpanStatusCode.ERROR, message: msg });
+          exchangeSpan.end();
+        }
+        this.send('User', 'chat_result', { error: msg }, traceId);
         this.sim.scheduleDrain();
       });
   }
@@ -344,6 +430,10 @@ class LLMService extends Service {
 function buildSimulation() {
   const sim = new Simulation();
   sim.trace.setSink(new IndexedDbSink());
+  sim.tracer = setupOtel(
+    (span) => sim.trace.recordOtelStart(span),
+    (span) => sim.trace.recordOtelEnd(span),
+  );
   sim.register(new UserService());
   sim.register(new LLMService());
   return sim;
@@ -576,14 +666,36 @@ function mostRecentTraceOnly(trace) {
 
 function FlowPanel({ sim, trace, showAll }) {
   const names = sim.serviceNames();
-  const scopedTrace = useMemo(() => (showAll ? trace : mostRecentTraceOnly(trace)), [trace, showAll]);
-  const sendEntries = useMemo(() => scopedTrace.filter((e) => e.kind === 'send'), [scopedTrace]);
+  const allOtel = useMemo(() => trace.filter((e) => e.kind === 'otel'), [trace]);
+  const scopedSpans = useMemo(() => {
+    if (showAll || allOtel.length === 0) return allOtel;
+    const lastTraceId = allOtel[allOtel.length - 1].traceId;
+    return allOtel.filter((s) => s.traceId === lastTraceId);
+  }, [allOtel, showAll]);
+  const spanEvents = useMemo(() => {
+    const evs = [];
+    for (const s of scopedSpans) {
+      evs.push({ type: 'start', span: s, timeMs: s.startTimeMs });
+      if (s.endTimeMs != null) evs.push({ type: 'end', span: s, timeMs: s.endTimeMs });
+    }
+    evs.sort((a, b) => {
+      if (a.timeMs !== b.timeMs) return a.timeMs - b.timeMs;
+      if (a.type !== b.type) return a.type === 'start' ? -1 : 1;
+      if (a.type === 'start') return a.span.order - b.span.order;
+      return b.span.order - a.span.order;
+    });
+    return evs;
+  }, [scopedSpans]);
   const [stepIdx, setStepIdx] = useState(-1);
 
-  useEffect(() => { setStepIdx(sendEntries.length - 1); }, [sendEntries.length]);
+  useEffect(() => { setStepIdx(spanEvents.length - 1); }, [spanEvents.length]);
 
-  const currentSend = stepIdx >= 0 && stepIdx < sendEntries.length ? sendEntries[stepIdx] : null;
-  const activeName = currentSend ? currentSend.to : null;
+  const currentEvent = stepIdx >= 0 && stepIdx < spanEvents.length ? spanEvents[stepIdx] : null;
+  const currentSpan = currentEvent?.span ?? null;
+  const fromName = currentSpan?.attributes?.['chat.from'];
+  const toName = currentSpan?.attributes?.['chat.to'];
+  const activeName = currentEvent?.type === 'start' ? toName : null;
+  const currentSend = currentSpan && fromName && toName ? { from: fromName, to: toName, type: currentSpan.name, at: currentEvent.timeMs } : null;
   const positions = {
     User: { x: 40, y: 120 },
     LLM: { x: 320, y: 120 },
@@ -672,14 +784,14 @@ function FlowPanel({ sim, trace, showAll }) {
           className={sliderClass}
           type="range"
           min={-1}
-          max={Math.max(sendEntries.length - 1, -1)}
+          max={Math.max(spanEvents.length - 1, -1)}
           step={1}
           value={stepIdx}
           onChange={(e) => setStepIdx(Number(e.target.value))}
-          disabled={sendEntries.length === 0}
+          disabled={spanEvents.length === 0}
         />
         <span className={stepLabelClass}>
-          {currentSend ? `t=${currentSend.at} ${currentSend.from}→${currentSend.to}` : sendEntries.length === 0 ? 'no scenario' : 'start'}
+          {currentEvent ? `${currentEvent.type} ${currentEvent.span.name}${currentSend ? ` ${currentSend.from}→${currentSend.to}` : ''}` : spanEvents.length === 0 ? 'no spans' : 'start'}
         </span>
       </div>
       <div style={{ flex: 1, minHeight: 0, width: '100%', background: 'var(--surface-alt)' }}>
@@ -702,7 +814,49 @@ function FlowPanel({ sim, trace, showAll }) {
   );
 }
 
+function buildSpanTree(spans) {
+  const ids = new Set(spans.map((s) => s.spanId));
+  const byParent = new Map();
+  const roots = [];
+  const sorted = spans.slice().sort((a, b) => a.startTimeMs - b.startTimeMs || a.order - b.order);
+  for (const s of sorted) {
+    const parentPresent = s.parentSpanId && ids.has(s.parentSpanId);
+    if (!parentPresent) roots.push(s);
+    else {
+      if (!byParent.has(s.parentSpanId)) byParent.set(s.parentSpanId, []);
+      byParent.get(s.parentSpanId).push(s);
+    }
+  }
+  const ordered = [];
+  const effectiveStatus = new Map();
+  const computeStatus = (span) => {
+    if (effectiveStatus.has(span.spanId)) return effectiveStatus.get(span.spanId);
+    const children = byParent.get(span.spanId) ?? [];
+    let status = span.status;
+    for (const c of children) {
+      const cs = computeStatus(c);
+      if (cs === 'error') status = 'error';
+    }
+    effectiveStatus.set(span.spanId, status);
+    return status;
+  };
+  const walk = (span, depth) => {
+    ordered.push({ span, depth, effectiveStatus: computeStatus(span) });
+    const children = byParent.get(span.spanId) ?? [];
+    for (const c of children) walk(c, depth + 1);
+  };
+  for (const r of roots) walk(r, 0);
+  return ordered;
+}
+
 function LogsPanel({ trace, showAll, onToggleShowAll }) {
+  const allOtel = trace.filter((e) => e.kind === 'otel');
+  let shownOtel = allOtel;
+  if (!showAll && allOtel.length > 0) {
+    const lastTraceId = allOtel[allOtel.length - 1].traceId;
+    shownOtel = allOtel.filter((s) => s.traceId === lastTraceId);
+  }
+  const tree = buildSpanTree(shownOtel);
   const shown = showAll ? trace : mostRecentTraceOnly(trace);
   const row = css`
     display: grid;
@@ -742,38 +896,27 @@ function LogsPanel({ trace, showAll, onToggleShowAll }) {
         </label>
       }
     >
-      {shown.length === 0 ? (
-        <div className={empty}>No events yet. Send a message.</div>
+      {tree.length === 0 ? (
+        <div className={empty}>No spans yet. Send a message.</div>
       ) : (
-        <>
-          <div className={head}>
-            <span>t</span>
-            <span>kind</span>
-            <span>trace</span>
-            <span>span</span>
-            <span>parent</span>
-            <span>service</span>
-            <span>detail</span>
-          </div>
-          {shown.map((entry, i) => {
-            const t = atOf(entry);
-            const traceId = 'traceId' in entry ? entry.traceId : '';
-            const spanId = 'spanId' in entry ? entry.spanId : '';
-            const parentSpanId = 'parentSpanId' in entry ? entry.parentSpanId : '';
-            const service = ('service' in entry && entry.service) || ('from' in entry && typeof entry.from === 'string' && entry.from) || '';
+        <div style={{ padding: '8px 14px', fontFamily: 'var(--font-mono)', fontSize: 11.5, color: 'var(--ink-2)' }}>
+          {tree.map(({ span, depth, effectiveStatus }, i) => {
+            const isPending = span.endTimeMs == null;
+            const dur = isPending ? null : Math.max(0, span.endTimeMs - span.startTimeMs).toFixed(1);
+            const traceShort = span.traceId.slice(0, 8);
+            const spanShort = span.spanId.slice(0, 8);
+            const attrsStr = JSON.stringify(span.attributes);
+            const color = isPending ? 'var(--ink-4)' : effectiveStatus === 'error' ? 'var(--warn-ink)' : 'var(--good)';
             return (
-              <div key={i} className={row}>
-                <span className={at}>{t !== undefined ? `t=${t}` : ''}</span>
-                <span><span className={badgeStyle(entry.kind)}>{entry.kind}</span></span>
-                <span>{traceId || ''}</span>
-                <span className={dim}>{spanId || ''}</span>
-                <span className={dim}>{parentSpanId || ''}</span>
-                <span>{service}</span>
-                <span>{formatEntry(entry)}</span>
+              <div key={span.spanId} style={{ paddingLeft: depth * 18, padding: '4px 0', borderBottom: '1px dashed var(--line)' }}>
+                <span style={{ color: 'var(--ink-4)' }}>[trace={traceShort}][span={spanShort}] </span>
+                <span style={{ color, fontWeight: 600 }}>{span.name}</span>
+                <span style={{ color: 'var(--ink-3)' }}> {attrsStr}</span>
+                <span style={{ color: 'var(--ink-4)' }}> {isPending ? '(pending)' : `(${dur}ms)`}</span>
               </div>
             );
           })}
-        </>
+        </div>
       )}
     </Panel>
   );
