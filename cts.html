@@ -380,15 +380,13 @@ class UserService extends Service {
     const { turnIdx, turns, transcript, seedPrompt, target, gameCtx, hideTarget } = this.state;
     if (turnIdx >= turns) return;
     const tracer = this.sim.tracer;
-    const turnSpan = tracer.startSpan(`cts.turn`, { attributes: { 'cts.turnIdx': turnIdx } }, gameCtx);
-    const turnCtx = otelTrace.setSpan(gameCtx, turnSpan);
     const messages = [
       { role: 'system', content: seedPrompt },
       ...(hideTarget ? [] : [{ role: 'system', content: `Target: ${target}` }]),
       ...transcript.map((t) => ({ role: 'assistant', content: t })),
     ];
-    const promptSpan = tracer.startSpan('cts.prompt', { attributes: { 'chat.from': 'User', 'chat.to': 'LLM', 'cts.turnIdx': turnIdx, 'cts.messages': JSON.stringify(messages) } }, turnCtx);
-    promptSpan.end();
+    const turnSpan = tracer.startSpan(`cts.turn`, { attributes: { 'cts.turnIdx': turnIdx, 'chat.from': 'User', 'chat.to': 'LLM', 'cts.messages': JSON.stringify(messages) } }, gameCtx);
+    const turnCtx = otelTrace.setSpan(gameCtx, turnSpan);
     this.send('LLM', 'turn', { messages, turnIdx, turnCtx, turnSpan });
   }
   handle(message) {
@@ -781,14 +779,14 @@ function mostRecentTraceOnly(trace) {
   return trace.filter((e) => 'traceId' in e && e.traceId === lastTraceId);
 }
 
-function FlowPanel({ sim, trace, stepIdx, setStepIdx }) {
+function FlowPanel({ sim, trace, stepIdx, setStepIdx, logsView }) {
   const allOtel = useMemo(() => trace.filter((e) => e.kind === 'otel'), [trace]);
   const scopedSpans = useMemo(() => {
     if (allOtel.length === 0) return allOtel;
     const lastTraceId = allOtel[allOtel.length - 1].traceId;
     return allOtel.filter((s) => s.traceId === lastTraceId);
   }, [allOtel]);
-  const spanEvents = useMemo(() => {
+  const startEndEvents = useMemo(() => {
     const evs = [];
     for (const s of scopedSpans) {
       evs.push({ type: 'start', span: s, timeMs: s.startTimeMs, seq: s.startSeq ?? 0 });
@@ -797,6 +795,11 @@ function FlowPanel({ sim, trace, stepIdx, setStepIdx }) {
     evs.sort((a, b) => a.seq - b.seq);
     return evs;
   }, [scopedSpans]);
+  const treeEvents = useMemo(() => {
+    const tree = buildSpanTree(scopedSpans);
+    return tree.map(({ span }) => ({ type: 'start', span, timeMs: span.startTimeMs, seq: span.startSeq ?? 0 }));
+  }, [scopedSpans]);
+  const spanEvents = logsView === 'startEnd' ? startEndEvents : treeEvents;
 
   useEffect(() => { setStepIdx(spanEvents.length - 1); }, [spanEvents.length, setStepIdx]);
 
@@ -813,7 +816,7 @@ function FlowPanel({ sim, trace, stepIdx, setStepIdx }) {
   for (let i = stepIdx; i >= 0; i -= 1) {
     const ev = spanEvents[i];
     if (ev?.type !== 'start') continue;
-    if (ev.span?.name !== 'cts.prompt') continue;
+    if (ev.span?.name !== 'cts.turn') continue;
     const raw = ev.span.attributes?.['cts.messages'];
     if (typeof raw === 'string') {
       try { currentMessages = JSON.parse(raw); } catch { currentMessages = []; }
@@ -823,10 +826,11 @@ function FlowPanel({ sim, trace, stepIdx, setStepIdx }) {
   let currentResponse = null;
   for (let i = stepIdx; i >= 0; i -= 1) {
     const ev = spanEvents[i];
-    if (ev?.type !== 'end') continue;
-    if (ev.span?.name !== 'cts.response') continue;
-    if (ev.span.attributes?.['cts.turnIdx'] !== activeTurn) continue;
-    const out = ev.span.attributes?.['cts.output'];
+    if (!ev) continue;
+    const span = ev.span;
+    if (span?.name !== 'cts.response') continue;
+    if (span.attributes?.['cts.turnIdx'] !== activeTurn) continue;
+    const out = span.attributes?.['cts.output'];
     if (typeof out === 'string') { currentResponse = out; break; }
   }
   const turnsAttr = scopedSpans.find((s) => typeof s.attributes?.['cts.turns'] === 'number')?.attributes?.['cts.turns'] ?? 5;
@@ -1383,7 +1387,7 @@ function App() {
           <GamePanel sim={sim} trace={trace} />
         </div>
         <div style={{ gridRow: '1 / 2', gridColumn: '2 / 3', minHeight: 0 }}>
-          <FlowPanel sim={sim} trace={trace} stepIdx={stepIdx} setStepIdx={setStepIdx} />
+          <FlowPanel sim={sim} trace={trace} stepIdx={stepIdx} setStepIdx={setStepIdx} logsView={logsView} />
         </div>
         <div style={{ gridRow: '1 / 2', gridColumn: '3 / 4', minHeight: 0 }}>
           <CaptureTheStringPanel />
