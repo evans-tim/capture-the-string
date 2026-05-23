@@ -367,18 +367,40 @@ class UserService extends Service {
   constructor() {
     super('User');
   }
-  userChat(text) {
-    this.setState({ lastChat: text });
+  runGame({ target, seedPrompt, turns }) {
     const tracer = this.sim.tracer;
-    const exchangeSpan = tracer.startSpan('chat.exchange', { attributes: { 'chat.message': text } });
-    const exchangeCtx = otelTrace.setSpan(otelContext.active(), exchangeSpan);
-    const sendSpan = tracer.startSpan('chat.send', { attributes: { 'chat.from': 'User', 'chat.to': 'LLM', 'chat.message': text } }, exchangeCtx);
+    const gameSpan = tracer.startSpan('cts.game', { attributes: { 'cts.target': target, 'cts.seedPrompt': seedPrompt, 'cts.turns': turns } });
+    const gameCtx = otelTrace.setSpan(otelContext.active(), gameSpan);
+    this.setState({ target, seedPrompt, turns, transcript: [], turnIdx: 0, gameSpan, gameCtx, status: 'running' });
+    this.startTurn();
+  }
+  startTurn() {
+    const { turnIdx, turns, transcript, seedPrompt, gameCtx } = this.state;
+    if (turnIdx >= turns) return;
+    const tracer = this.sim.tracer;
+    const turnSpan = tracer.startSpan(`cts.turn`, { attributes: { 'cts.turnIdx': turnIdx } }, gameCtx);
+    const turnCtx = otelTrace.setSpan(gameCtx, turnSpan);
+    const exchangeSpan = tracer.startSpan('chat.exchange', { attributes: { 'cts.turnIdx': turnIdx } }, turnCtx);
+    const exchangeCtx = otelTrace.setSpan(turnCtx, exchangeSpan);
+    const sendSpan = tracer.startSpan('chat.send', { attributes: { 'chat.from': 'User', 'chat.to': 'LLM' } }, exchangeCtx);
     sendSpan.end();
-    this.send('LLM', 'chat', { text, exchangeCtx, exchangeSpan });
+    this.send('LLM', 'turn', { seedPrompt, transcript, turnIdx, exchangeCtx, exchangeSpan, turnSpan });
   }
   handle(message) {
-    if (message.type === 'chat_result') {
-      this.setState({ lastChat: message.payload });
+    if (message.type === 'turn_result') {
+      const { text, turnSpan } = message.payload;
+      const transcript = [...(this.state.transcript ?? []), text];
+      turnSpan.setAttribute('cts.output', text);
+      turnSpan.end();
+      const nextIdx = this.state.turnIdx + 1;
+      this.setState({ transcript, turnIdx: nextIdx });
+      if (nextIdx >= this.state.turns) {
+        this.state.gameSpan.setAttribute('cts.outcome', 'loss');
+        this.state.gameSpan.end();
+        this.setState({ status: 'loss' });
+      } else {
+        this.startTurn();
+      }
     }
   }
 }
@@ -388,29 +410,29 @@ class LLMService extends Service {
     super('LLM');
   }
   handle(message) {
-    if (message.type === 'chat') {
-      const { text, exchangeCtx, exchangeSpan } = message.payload;
-      this.callLlm(text, message.traceId, exchangeCtx, exchangeSpan);
+    if (message.type === 'turn') {
+      const { seedPrompt, transcript, turnIdx, exchangeCtx, exchangeSpan, turnSpan } = message.payload;
+      this.callLlm({ seedPrompt, transcript, turnIdx, traceId: message.traceId, exchangeCtx, exchangeSpan, turnSpan });
     }
   }
 
-  callLlm(text, traceId, exchangeCtx, exchangeSpan) {
+  callLlm({ seedPrompt, transcript, turnIdx, traceId, exchangeCtx, exchangeSpan, turnSpan }) {
     const apiKey = window.VITE_OPENAI_API_KEY || '';
     const openai = createOpenAI({ apiKey });
-    const prompt = text;
+    const messages = [
+      { role: 'system', content: seedPrompt },
+      ...transcript.map((t) => ({ role: 'assistant', content: t })),
+    ];
     const model = 'gpt-4o-mini';
     const tracer = this.sim.tracer;
-    const parentCtx = exchangeCtx ?? otelContext.active();
-    const recvSpan = tracer.startSpan('chat.receive', { attributes: { 'chat.from': 'LLM', 'chat.to': 'User' } }, parentCtx);
-    generateText({ model: openai(model), prompt })
+    const recvSpan = tracer.startSpan('chat.receive', { attributes: { 'chat.from': 'LLM', 'chat.to': 'User', 'cts.turnIdx': turnIdx, 'chat.transcriptLength': transcript.length } }, exchangeCtx);
+    generateText({ model: openai(model), messages })
       .then((result) => {
         recvSpan.setAttribute('chat.message', result.text);
-        if (exchangeSpan) {
-          exchangeSpan.setAttribute('chat.response', result.text);
-        }
+        exchangeSpan.setAttribute('chat.response', result.text);
         recvSpan.end();
-        if (exchangeSpan) exchangeSpan.end();
-        this.send('User', 'chat_result', { text: result.text }, traceId);
+        exchangeSpan.end();
+        this.send('User', 'turn_result', { text: result.text, turnSpan }, traceId);
         this.sim.scheduleDrain();
       })
       .catch((error) => {
@@ -418,11 +440,10 @@ class LLMService extends Service {
         recvSpan.setAttribute('chat.error', msg);
         recvSpan.setStatus({ code: SpanStatusCode.ERROR, message: msg });
         recvSpan.end();
-        if (exchangeSpan) {
-          exchangeSpan.setStatus({ code: SpanStatusCode.ERROR, message: msg });
-          exchangeSpan.end();
-        }
-        this.send('User', 'chat_result', { error: msg }, traceId);
+        exchangeSpan.setStatus({ code: SpanStatusCode.ERROR, message: msg });
+        exchangeSpan.end();
+        turnSpan.setStatus({ code: SpanStatusCode.ERROR, message: msg });
+        this.send('User', 'turn_result', { text: `[error: ${msg}]`, turnSpan }, traceId);
         this.sim.scheduleDrain();
       });
   }
@@ -957,12 +978,17 @@ function LogsPanel({ trace, showStartEnd, onToggleShowStartEnd, stepIdx }) {
 }
 
 
-function FrontendPanel({ sim, trace }) {
-  const [chat, setChat] = useState('');
+function GamePanel({ sim, trace }) {
+  const [target, setTarget] = useState('hello world');
+  const [seedPrompt, setSeedPrompt] = useState('Output only the target string, nothing else.');
+  const [turns, setTurns] = useState(5);
 
-  const lastChat = [...trace].reverse().find(
-    (e) => e.kind === 'handle' && e.service === 'User' && e.type === 'chat_result'
+  const lastUserState = [...trace].reverse().find(
+    (e) => e.kind === 'state' && e.service === 'User'
   );
+  const userState = lastUserState?.state ?? {};
+  const transcript = userState.transcript ?? [];
+  const status = userState.status;
 
   const windowClass = css`
     margin: 14px;
@@ -1016,39 +1042,92 @@ function FrontendPanel({ sim, trace }) {
     color: var(--ink-2);
   `;
   const rowClass = css`display: flex; gap: 8px; flex-wrap: wrap;`;
+  const transcriptClass = css`
+    display: flex; flex-direction: column; gap: 6px;
+    font-family: var(--font-mono); font-size: 11.5px;
+  `;
+  const turnRowClass = css`
+    padding: 6px 10px;
+    background: var(--surface-alt);
+    border: 1px solid var(--line);
+    border-radius: var(--radius-sm);
+    color: var(--ink-2);
+  `;
 
-  const sendChat = () => {
-    const presence = sim.get('User');
-    presence.userChat(chat);
+  const runCts = () => {
+    const user = sim.get('User');
+    user.runGame({ target, seedPrompt, turns: Number(turns) });
     sim.drain();
-    setChat('');
   };
 
   return (
-    <Panel title="Frontend">
+    <Panel title="Game Board">
       <div className={windowClass}>
         <div className={titleBar}>
           <span className={dotRed} />
           <span className={dotYellow} />
           <span className={dotGreen} />
-          <span style={{ marginLeft: 6 }}>app</span>
+          <span style={{ marginLeft: 6 }}>cts</span>
         </div>
         <div className={body}>
-          <label className={labelClass}>Chat (LLM)</label>
+          <label className={labelClass}>Target</label>
           <input
             className={inputClass}
-            value={chat}
-            onChange={(e) => setChat(e.target.value)}
-            onKeyDown={(e) => { if (e.key === 'Enter') sendChat(); }}
-            placeholder="say something..."
+            value={target}
+            onChange={(e) => setTarget(e.target.value)}
+          />
+          <label className={labelClass}>Seed Prompt</label>
+          <input
+            className={inputClass}
+            value={seedPrompt}
+            onChange={(e) => setSeedPrompt(e.target.value)}
+          />
+          <label className={labelClass}>Turns</label>
+          <input
+            className={inputClass}
+            type="number"
+            min={1}
+            value={turns}
+            onChange={(e) => setTurns(e.target.value)}
           />
           <div className={rowClass}>
-            <Button variant="accent" onClick={sendChat}>Send</Button>
+            <Button variant="accent" onClick={runCts}>Run CTS</Button>
           </div>
-          {lastChat && (
-            <div className={result}>{JSON.stringify(lastChat.payload)}</div>
+          {transcript.length > 0 && (
+            <div className={transcriptClass}>
+              {transcript.map((t, i) => (
+                <div key={i} className={turnRowClass}>
+                  <span style={{ color: 'var(--ink-4)' }}>t{i}: </span>{t}
+                </div>
+              ))}
+              {status && (
+                <div className={result}>status: {status}</div>
+              )}
+            </div>
           )}
         </div>
+      </div>
+    </Panel>
+  );
+}
+
+function CaptureTheStringPanel() {
+  const proseClass = css`
+    padding: 16px 18px;
+    color: var(--ink);
+    font-size: 13px;
+    line-height: 1.55;
+    p { margin: 0 0 12px 0; }
+    p:last-child { margin-bottom: 0; }
+  `;
+  return (
+    <Panel title="Capture the String">
+      <div className={proseClass}>
+        <p>Capture the String (CTS) is a simple LLM eval game. Following von Neumann, we start with the one-person case: a pure maximization problem with no opponent.</p>
+        <p>In the single-player game, a fixed target string is chosen in advance, along with a turn budget that caps how long the game can run. A single player takes turns emitting one message per turn, and the running transcript of everything the player has said so far accumulates as the game's context. The game resolves to a payoff of either +1 or -1.</p>
+        <p>Termination is straightforward: the game ends the first turn the player's message exactly matches the target (a win, payoff +1), or when the budget runs out without a match (a loss, payoff -1).</p>
+        <p>To instantiate a game, you pick a concrete target, budget, and player — for example, target "hello world", budget 5, player GPT-4. That tuple alone doesn't fully specify behavior, though, since it leaves open what the player actually sees on each turn.</p>
+        <p>The game engine is what fills that gap: it drives turns, decides what context the player is shown, and adjudicates termination. Open questions include whether the player sees a system prompt explaining the rules, whether it sees its own prior outputs, and how the win-check is performed (exact match, normalized, etc.).</p>
       </div>
     </Panel>
   );
@@ -1074,7 +1153,7 @@ const logoClass = css`
 const gridClass = css`
   flex: 1;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(0, 2fr);
+  grid-template-columns: minmax(0, 1fr) minmax(0, 2fr) minmax(0, 1fr);
   grid-template-rows: 1.4fr 1fr;
   gap: 14px;
   padding: 14px;
@@ -1116,12 +1195,15 @@ function App() {
       </div>
       <div className={gridClass}>
         <div style={{ gridRow: '1 / 2', gridColumn: '1 / 2', minHeight: 0 }}>
-          <FrontendPanel sim={sim} trace={trace} />
+          <GamePanel sim={sim} trace={trace} />
         </div>
         <div style={{ gridRow: '1 / 2', gridColumn: '2 / 3', minHeight: 0 }}>
           <FlowPanel sim={sim} trace={trace} stepIdx={stepIdx} setStepIdx={setStepIdx} />
         </div>
-        <div style={{ gridRow: '2 / 3', gridColumn: '1 / 3', minHeight: 0 }}>
+        <div style={{ gridRow: '1 / 2', gridColumn: '3 / 4', minHeight: 0 }}>
+          <CaptureTheStringPanel />
+        </div>
+        <div style={{ gridRow: '2 / 3', gridColumn: '1 / 4', minHeight: 0 }}>
           <LogsPanel trace={trace} showStartEnd={showStartEnd} onToggleShowStartEnd={setShowStartEnd} stepIdx={stepIdx} />
         </div>
       </div>
