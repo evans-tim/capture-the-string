@@ -191,11 +191,12 @@ class TraceLog {
       attributes: { ...(span.attributes ?? {}) },
       status: 'pending',
       order: this.otelSpans.length,
+      startSeq: this.otelEvents.length,
     };
     this.otelById.set(sc.spanId, entry);
     this.otelSpans.push(entry);
     this.entries.push(entry);
-    this.otelEvents.push({ type: 'start', spanId: sc.spanId, timeMs: entry.startTimeMs });
+    this.otelEvents.push({ type: 'start', spanId: sc.spanId, timeMs: entry.startTimeMs, seq: this.otelEvents.length });
     if (this.sink) this.sink.append({ ...entry, event: 'start' });
     for (const l of this.listeners) l(entry);
   }
@@ -210,7 +211,8 @@ class TraceLog {
       existing.status = status;
       existing.attributes = attributes;
     }
-    this.otelEvents.push({ type: 'end', spanId: sc.spanId, timeMs: endTimeMs });
+    if (existing) existing.endSeq = this.otelEvents.length;
+    this.otelEvents.push({ type: 'end', spanId: sc.spanId, timeMs: endTimeMs, seq: this.otelEvents.length });
     if (this.sink) this.sink.append({ kind: 'otel', event: 'end', spanId: sc.spanId, endTimeMs, status, attributes });
     for (const l of this.listeners) l(existing);
   }
@@ -380,21 +382,29 @@ class UserService extends Service {
     const tracer = this.sim.tracer;
     const turnSpan = tracer.startSpan(`cts.turn`, { attributes: { 'cts.turnIdx': turnIdx } }, gameCtx);
     const turnCtx = otelTrace.setSpan(gameCtx, turnSpan);
-    const exchangeSpan = tracer.startSpan('chat.exchange', { attributes: { 'cts.turnIdx': turnIdx } }, turnCtx);
-    const exchangeCtx = otelTrace.setSpan(turnCtx, exchangeSpan);
-    const sendSpan = tracer.startSpan('chat.send', { attributes: { 'chat.from': 'User', 'chat.to': 'LLM' } }, exchangeCtx);
-    sendSpan.end();
-    this.send('LLM', 'turn', { seedPrompt, transcript, turnIdx, exchangeCtx, exchangeSpan, turnSpan });
+    const messages = [
+      { role: 'system', content: seedPrompt },
+      ...transcript.map((t) => ({ role: 'assistant', content: t })),
+    ];
+    const promptSpan = tracer.startSpan('cts.prompt', { attributes: { 'chat.from': 'User', 'chat.to': 'LLM', 'cts.turnIdx': turnIdx, 'cts.messages': JSON.stringify(messages) } }, turnCtx);
+    promptSpan.end();
+    this.send('LLM', 'turn', { messages, turnIdx, turnCtx, turnSpan });
   }
   handle(message) {
     if (message.type === 'turn_result') {
       const { text, turnSpan } = message.payload;
       const transcript = [...(this.state.transcript ?? []), text];
+      const matched = text === this.state.target;
       turnSpan.setAttribute('cts.output', text);
+      turnSpan.setAttribute('cts.match', matched);
       turnSpan.end();
       const nextIdx = this.state.turnIdx + 1;
       this.setState({ transcript, turnIdx: nextIdx });
-      if (nextIdx >= this.state.turns) {
+      if (matched) {
+        this.state.gameSpan.setAttribute('cts.outcome', 'win');
+        this.state.gameSpan.end();
+        this.setState({ status: 'win' });
+      } else if (nextIdx >= this.state.turns) {
         this.state.gameSpan.setAttribute('cts.outcome', 'loss');
         this.state.gameSpan.end();
         this.setState({ status: 'loss' });
@@ -411,37 +421,28 @@ class LLMService extends Service {
   }
   handle(message) {
     if (message.type === 'turn') {
-      const { seedPrompt, transcript, turnIdx, exchangeCtx, exchangeSpan, turnSpan } = message.payload;
-      this.callLlm({ seedPrompt, transcript, turnIdx, traceId: message.traceId, exchangeCtx, exchangeSpan, turnSpan });
+      const { messages, turnIdx, turnCtx, turnSpan } = message.payload;
+      this.callLlm({ messages, turnIdx, traceId: message.traceId, turnCtx, turnSpan });
     }
   }
 
-  callLlm({ seedPrompt, transcript, turnIdx, traceId, exchangeCtx, exchangeSpan, turnSpan }) {
+  callLlm({ messages, turnIdx, traceId, turnCtx, turnSpan }) {
     const apiKey = window.VITE_OPENAI_API_KEY || '';
     const openai = createOpenAI({ apiKey });
-    const messages = [
-      { role: 'system', content: seedPrompt },
-      ...transcript.map((t) => ({ role: 'assistant', content: t })),
-    ];
     const model = 'gpt-4o-mini';
     const tracer = this.sim.tracer;
-    const recvSpan = tracer.startSpan('chat.receive', { attributes: { 'chat.from': 'LLM', 'chat.to': 'User', 'cts.turnIdx': turnIdx, 'chat.transcriptLength': transcript.length } }, exchangeCtx);
+    const responseSpan = tracer.startSpan('cts.response', { attributes: { 'chat.from': 'LLM', 'chat.to': 'User', 'cts.turnIdx': turnIdx } }, turnCtx);
     generateText({ model: openai(model), messages })
       .then((result) => {
-        recvSpan.setAttribute('chat.message', result.text);
-        exchangeSpan.setAttribute('chat.response', result.text);
-        recvSpan.end();
-        exchangeSpan.end();
+        responseSpan.setAttribute('cts.output', result.text);
+        responseSpan.end();
         this.send('User', 'turn_result', { text: result.text, turnSpan }, traceId);
         this.sim.scheduleDrain();
       })
       .catch((error) => {
         const msg = error instanceof Error ? error.message : String(error);
-        recvSpan.setAttribute('chat.error', msg);
-        recvSpan.setStatus({ code: SpanStatusCode.ERROR, message: msg });
-        recvSpan.end();
-        exchangeSpan.setStatus({ code: SpanStatusCode.ERROR, message: msg });
-        exchangeSpan.end();
+        responseSpan.setStatus({ code: SpanStatusCode.ERROR, message: msg });
+        responseSpan.end();
         turnSpan.setStatus({ code: SpanStatusCode.ERROR, message: msg });
         this.send('User', 'turn_result', { text: `[error: ${msg}]`, turnSpan }, traceId);
         this.sim.scheduleDrain();
@@ -732,15 +733,10 @@ function FlowPanel({ sim, trace, stepIdx, setStepIdx }) {
   const spanEvents = useMemo(() => {
     const evs = [];
     for (const s of scopedSpans) {
-      evs.push({ type: 'start', span: s, timeMs: s.startTimeMs });
-      if (s.endTimeMs != null) evs.push({ type: 'end', span: s, timeMs: s.endTimeMs });
+      evs.push({ type: 'start', span: s, timeMs: s.startTimeMs, seq: s.startSeq ?? 0 });
+      if (s.endTimeMs != null) evs.push({ type: 'end', span: s, timeMs: s.endTimeMs, seq: s.endSeq ?? 0 });
     }
-    evs.sort((a, b) => {
-      if (a.timeMs !== b.timeMs) return a.timeMs - b.timeMs;
-      if (a.type !== b.type) return a.type === 'start' ? -1 : 1;
-      if (a.type === 'start') return a.span.order - b.span.order;
-      return b.span.order - a.span.order;
-    });
+    evs.sort((a, b) => a.seq - b.seq);
     return evs;
   }, [scopedSpans]);
 
@@ -992,15 +988,10 @@ function LogsPanel({ trace, view, onViewChange, stepIdx }) {
   const events = useMemo(() => {
     const evs = [];
     for (const s of shownOtel) {
-      evs.push({ type: 'start', span: s, timeMs: s.startTimeMs });
-      if (s.endTimeMs != null) evs.push({ type: 'end', span: s, timeMs: s.endTimeMs });
+      evs.push({ type: 'start', span: s, timeMs: s.startTimeMs, seq: s.startSeq ?? 0 });
+      if (s.endTimeMs != null) evs.push({ type: 'end', span: s, timeMs: s.endTimeMs, seq: s.endSeq ?? 0 });
     }
-    evs.sort((a, b) => {
-      if (a.timeMs !== b.timeMs) return a.timeMs - b.timeMs;
-      if (a.type !== b.type) return a.type === 'start' ? -1 : 1;
-      if (a.type === 'start') return a.span.order - b.span.order;
-      return b.span.order - a.span.order;
-    });
+    evs.sort((a, b) => a.seq - b.seq);
     return evs;
   }, [shownOtel]);
   const row = css`
