@@ -922,7 +922,66 @@ function buildSpanTree(spans) {
   return ordered;
 }
 
-function LogsPanel({ trace, showStartEnd, onToggleShowStartEnd, stepIdx }) {
+function WaterfallView({ tree }) {
+  if (tree.length === 0) return null;
+  let minStart = Infinity;
+  let maxEnd = -Infinity;
+  const now = Date.now();
+  for (const { span } of tree) {
+    if (span.startTimeMs < minStart) minStart = span.startTimeMs;
+    const end = span.endTimeMs ?? now;
+    if (end > maxEnd) maxEnd = end;
+  }
+  const total = Math.max(1, maxEnd - minStart);
+  const rowClass = css`
+    display: grid;
+    grid-template-columns: 260px 70px 1fr;
+    gap: 8px;
+    padding: 4px 14px;
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    color: var(--ink-2);
+    border-bottom: 1px dashed var(--line);
+    align-items: center;
+  `;
+  const barTrack = css`
+    position: relative;
+    height: 14px;
+    background: var(--surface-alt);
+    border-radius: 3px;
+    overflow: hidden;
+  `;
+  return (
+    <div style={{ padding: '8px 0' }}>
+      {tree.map(({ span, depth, effectiveStatus }) => {
+        const isPending = span.endTimeMs == null;
+        const end = span.endTimeMs ?? now;
+        const leftPct = ((span.startTimeMs - minStart) / total) * 100;
+        const widthPct = Math.max(0.5, ((end - span.startTimeMs) / total) * 100);
+        const dur = isPending ? null : Math.max(0, span.endTimeMs - span.startTimeMs).toFixed(1);
+        const color = isPending ? 'var(--ink-4)' : effectiveStatus === 'error' ? 'var(--warn-ink)' : 'var(--good)';
+        const barColor = isPending ? 'var(--ink-4)' : effectiveStatus === 'error' ? 'var(--warn)' : 'var(--primary)';
+        return (
+          <div key={span.spanId} className={rowClass}>
+            <div style={{ paddingLeft: depth * 14, color, fontWeight: 600, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+              {span.name}
+            </div>
+            <div style={{ color: 'var(--ink-4)', textAlign: 'right' }}>
+              {isPending ? 'pending' : `${dur}ms`}
+            </div>
+            <div className={barTrack}>
+              <div style={{ position: 'absolute', left: `${leftPct}%`, width: `${widthPct}%`, top: 0, bottom: 0, background: barColor, opacity: isPending ? 0.4 : 0.85, borderRadius: 3 }} />
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function LogsPanel({ trace, view, onViewChange, stepIdx }) {
+  const showStartEnd = view === 'startEnd';
+  const showWaterfall = view === 'waterfall';
   const allOtel = trace.filter((e) => e.kind === 'otel');
   let shownOtel = allOtel;
   if (allOtel.length > 0) {
@@ -976,14 +1035,21 @@ function LogsPanel({ trace, showStartEnd, onToggleShowStartEnd, stepIdx }) {
     <Panel
       title="Trace Log"
       headerRight={
-        <label style={{ display: 'inline-flex', alignItems: 'center', gap: 6, textTransform: 'none', letterSpacing: 0, fontWeight: 500 }}>
-          <input type="checkbox" checked={showStartEnd} onChange={(e) => onToggleShowStartEnd(e.target.checked)} />
-          show start/end
-        </label>
+        <select
+          value={view}
+          onChange={(e) => onViewChange(e.target.value)}
+          style={{ textTransform: 'none', letterSpacing: 0, fontWeight: 500, fontSize: 12, padding: '3px 6px', border: '1px solid var(--line-strong)', borderRadius: 6, background: 'var(--surface)', color: 'var(--ink)' }}
+        >
+          <option value="tree">tree</option>
+          <option value="startEnd">start/end</option>
+          <option value="waterfall">waterfall</option>
+        </select>
       }
     >
       {(showStartEnd ? events.length === 0 : tree.length === 0) ? (
         <div className={empty}>No spans yet. Send a message.</div>
+      ) : showWaterfall ? (
+        <WaterfallView tree={tree} />
       ) : showStartEnd ? (
         <div style={{ padding: '8px 14px', fontFamily: 'var(--font-mono)', fontSize: 11.5, color: 'var(--ink-2)' }}>
           {events.map((ev, i) => {
@@ -1215,7 +1281,7 @@ const gridClass = css`
 
 function App() {
   const { sim, trace, reset } = useSim();
-  const [showStartEnd, setShowStartEnd] = useState(false);
+  const [logsView, setLogsView] = useState('tree');
   const [stepIdx, setStepIdx] = useState(-1);
 
   const exportTrace = useCallback(async () => {
@@ -1256,7 +1322,7 @@ function App() {
           <CaptureTheStringPanel />
         </div>
         <div style={{ gridRow: '2 / 3', gridColumn: '1 / 4', minHeight: 0 }}>
-          <LogsPanel trace={trace} showStartEnd={showStartEnd} onToggleShowStartEnd={setShowStartEnd} stepIdx={stepIdx} />
+          <LogsPanel trace={trace} view={logsView} onViewChange={setLogsView} stepIdx={stepIdx} />
         </div>
       </div>
     </div>
