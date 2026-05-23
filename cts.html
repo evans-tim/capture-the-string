@@ -401,20 +401,21 @@ class LLMService extends Service {
     const model = 'gpt-4o-mini';
     const tracer = this.sim.tracer;
     const parentCtx = exchangeCtx ?? otelContext.active();
+    const recvSpan = tracer.startSpan('chat.receive', { attributes: { 'chat.from': 'LLM', 'chat.to': 'User' } }, parentCtx);
     generateText({ model: openai(model), prompt })
       .then((result) => {
-        const recvSpan = tracer.startSpan('chat.receive', { attributes: { 'chat.from': 'LLM', 'chat.to': 'User', 'chat.message': result.text } }, parentCtx);
-        recvSpan.end();
+        recvSpan.setAttribute('chat.message', result.text);
         if (exchangeSpan) {
           exchangeSpan.setAttribute('chat.response', result.text);
-          exchangeSpan.end();
         }
+        recvSpan.end();
+        if (exchangeSpan) exchangeSpan.end();
         this.send('User', 'chat_result', { text: result.text }, traceId);
         this.sim.scheduleDrain();
       })
       .catch((error) => {
         const msg = error instanceof Error ? error.message : String(error);
-        const recvSpan = tracer.startSpan('chat.receive', { attributes: { 'chat.from': 'LLM', 'chat.to': 'User', 'chat.error': msg } }, parentCtx);
+        recvSpan.setAttribute('chat.error', msg);
         recvSpan.setStatus({ code: SpanStatusCode.ERROR, message: msg });
         recvSpan.end();
         if (exchangeSpan) {
