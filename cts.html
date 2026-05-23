@@ -369,22 +369,22 @@ class UserService extends Service {
   constructor() {
     super('User');
   }
-  runGame({ target, seedPrompt, turns }) {
+  runGame({ target, seedPrompt, turns, hideTarget }) {
     const tracer = this.sim.tracer;
-    const gameSpan = tracer.startSpan('cts.game', { attributes: { 'cts.target': target, 'cts.seedPrompt': seedPrompt, 'cts.turns': turns } });
+    const gameSpan = tracer.startSpan('cts.game', { attributes: { 'cts.target': target, 'cts.seedPrompt': seedPrompt, 'cts.turns': turns, 'cts.hideTarget': !!hideTarget } });
     const gameCtx = otelTrace.setSpan(otelContext.active(), gameSpan);
-    this.setState({ target, seedPrompt, turns, transcript: [], turnIdx: 0, gameSpan, gameCtx, status: 'running' });
+    this.setState({ target, seedPrompt, turns, hideTarget: !!hideTarget, transcript: [], turnIdx: 0, gameSpan, gameCtx, status: 'running' });
     this.startTurn();
   }
   startTurn() {
-    const { turnIdx, turns, transcript, seedPrompt, target, gameCtx } = this.state;
+    const { turnIdx, turns, transcript, seedPrompt, target, gameCtx, hideTarget } = this.state;
     if (turnIdx >= turns) return;
     const tracer = this.sim.tracer;
     const turnSpan = tracer.startSpan(`cts.turn`, { attributes: { 'cts.turnIdx': turnIdx } }, gameCtx);
     const turnCtx = otelTrace.setSpan(gameCtx, turnSpan);
     const messages = [
       { role: 'system', content: seedPrompt },
-      { role: 'system', content: `Target: ${target}` },
+      ...(hideTarget ? [] : [{ role: 'system', content: `Target: ${target}` }]),
       ...transcript.map((t) => ({ role: 'assistant', content: t })),
     ];
     const promptSpan = tracer.startSpan('cts.prompt', { attributes: { 'chat.from': 'User', 'chat.to': 'LLM', 'cts.turnIdx': turnIdx, 'cts.messages': JSON.stringify(messages) } }, turnCtx);
@@ -1092,6 +1092,7 @@ function GamePanel({ sim, trace }) {
   const [target, setTarget] = useState('hello world');
   const [seedPrompt, setSeedPrompt] = useState('Output only the target string, nothing else.');
   const [turns, setTurns] = useState(5);
+  const [hideTarget, setHideTarget] = useState(false);
 
   const lastUserState = [...trace].reverse().find(
     (e) => e.kind === 'state' && e.service === 'User'
@@ -1166,7 +1167,7 @@ function GamePanel({ sim, trace }) {
 
   const runCts = () => {
     const user = sim.get('User');
-    user.runGame({ target, seedPrompt, turns: Number(turns) });
+    user.runGame({ target, seedPrompt, turns: Number(turns), hideTarget });
     sim.drain();
   };
 
@@ -1200,6 +1201,10 @@ function GamePanel({ sim, trace }) {
             value={turns}
             onChange={(e) => setTurns(e.target.value)}
           />
+          <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12.5, color: 'var(--ink-2)' }}>
+            <input type="checkbox" checked={hideTarget} onChange={(e) => setHideTarget(e.target.checked)} />
+            Hide target from LLM
+          </label>
           <div className={rowClass}>
             <Button variant="accent" onClick={runCts}>Run CTS</Button>
           </div>
