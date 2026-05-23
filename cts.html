@@ -680,16 +680,57 @@ const turnRowActiveClass = css`
 
 function TurnNode({ data }) {
   return (
-    <div className={turnNodeClass}>
-      <div className={roleClass}>Turn</div>
-      {data.rows.map((i) => (
-        <div key={i} className={`${turnRowItemClass} ${i === data.activeTurn ? turnRowActiveClass : ''}`}>{i}</div>
+    <div className={turnNodeClass} style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+      <div className={roleClass} style={{ marginBottom: 0 }}>Turn</div>
+      <div style={{ display: 'flex', gap: 4 }}>
+        {data.rows.map((i) => (
+          <div key={i} className={`${turnRowItemClass} ${i === data.activeTurn ? turnRowActiveClass : ''}`}>{i}</div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+const messagesNodeClass = css`
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 8px 10px;
+  width: 220px;
+  color: var(--ink);
+  font-size: 11.5px;
+  box-shadow: var(--shadow-sm);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+`;
+const messageRowClass = css`
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--ink-2);
+  padding: 3px 6px;
+  background: var(--surface-alt);
+  border-radius: var(--radius-sm);
+  white-space: pre-wrap;
+  word-break: break-word;
+`;
+
+function MessagesNode({ data }) {
+  return (
+    <div className={messagesNodeClass} style={{ transform: 'translateY(-50%)' }}>
+      <div className={roleClass}>Messages</div>
+      {data.messages.length === 0 ? (
+        <div className={messageRowClass} style={{ color: 'var(--ink-4)', fontStyle: 'italic' }}>none</div>
+      ) : data.messages.map((m, i) => (
+        <div key={i} className={messageRowClass} title={`${m.role}: ${m.content}`}>
+          <span style={{ color: 'var(--ink-4)' }}>{m.role}: </span>{m.content}
+        </div>
       ))}
     </div>
   );
 }
 
-const nodeTypes = { service: ServiceNode, turn: TurnNode };
+const nodeTypes = { service: ServiceNode, turn: TurnNode, messages: MessagesNode };
 
 const activeEdgeForwardClass = css`
   .react-flow__edge-path {
@@ -752,6 +793,17 @@ function FlowPanel({ sim, trace, stepIdx, setStepIdx }) {
     const t = ev.span?.attributes?.['cts.turnIdx'];
     if (typeof t === 'number') { activeTurn = t; break; }
   }
+  let currentMessages = [];
+  for (let i = stepIdx; i >= 0; i -= 1) {
+    const ev = spanEvents[i];
+    if (ev?.type !== 'start') continue;
+    if (ev.span?.name !== 'cts.prompt') continue;
+    const raw = ev.span.attributes?.['cts.messages'];
+    if (typeof raw === 'string') {
+      try { currentMessages = JSON.parse(raw); } catch { currentMessages = []; }
+      break;
+    }
+  }
   const turnsAttr = scopedSpans.find((s) => typeof s.attributes?.['cts.turns'] === 'number')?.attributes?.['cts.turns'] ?? 5;
   const turnRows = Array.from({ length: turnsAttr }, (_, i) => i);
   const fromName = currentSpan?.attributes?.['chat.from'];
@@ -770,8 +822,16 @@ function FlowPanel({ sim, trace, stepIdx, setStepIdx }) {
   const nodes = [{
     id: '__turn__',
     type: 'turn',
-    position: { x: 20, y: 80 },
+    position: { x: 290, y: 40 },
     data: { rows: turnRows, activeTurn },
+    style: { background: 'transparent', border: 'none', padding: 0, width: 'auto' },
+    draggable: false,
+    selectable: false,
+  }, {
+    id: '__messages__',
+    type: 'messages',
+    position: { x: -60, y: 150 },
+    data: { messages: currentMessages },
     style: { background: 'transparent', border: 'none', padding: 0, width: 'auto' },
     draggable: false,
     selectable: false,
