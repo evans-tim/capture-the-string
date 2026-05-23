@@ -652,7 +652,42 @@ function ServiceNode({ data }) {
   );
 }
 
-const nodeTypes = { service: ServiceNode };
+const turnNodeClass = css`
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 8px 10px;
+  min-width: 70px;
+  color: var(--ink);
+  font-size: 12px;
+  box-shadow: var(--shadow-sm);
+`;
+const turnRowItemClass = css`
+  padding: 4px 8px;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--ink-3);
+  border-radius: var(--radius-sm);
+  text-align: center;
+`;
+const turnRowActiveClass = css`
+  background: var(--primary-soft);
+  color: var(--primary-ink);
+  font-weight: 600;
+`;
+
+function TurnNode({ data }) {
+  return (
+    <div className={turnNodeClass}>
+      <div className={roleClass}>Turn</div>
+      {data.rows.map((i) => (
+        <div key={i} className={`${turnRowItemClass} ${i === data.activeTurn ? turnRowActiveClass : ''}`}>{i}</div>
+      ))}
+    </div>
+  );
+}
+
+const nodeTypes = { service: ServiceNode, turn: TurnNode };
 
 const activeEdgeForwardClass = css`
   .react-flow__edge-path {
@@ -713,20 +748,37 @@ function FlowPanel({ sim, trace, stepIdx, setStepIdx }) {
 
   const currentEvent = stepIdx >= 0 && stepIdx < spanEvents.length ? spanEvents[stepIdx] : null;
   const currentSpan = currentEvent?.span ?? null;
+  let activeTurn = null;
+  for (let i = stepIdx; i >= 0; i -= 1) {
+    const ev = spanEvents[i];
+    if (ev?.type !== 'start') continue;
+    const t = ev.span?.attributes?.['cts.turnIdx'];
+    if (typeof t === 'number') { activeTurn = t; break; }
+  }
+  const turnsAttr = scopedSpans.find((s) => typeof s.attributes?.['cts.turns'] === 'number')?.attributes?.['cts.turns'] ?? 5;
+  const turnRows = Array.from({ length: turnsAttr }, (_, i) => i);
   const fromName = currentSpan?.attributes?.['chat.from'];
   const toName = currentSpan?.attributes?.['chat.to'];
   const activeName = currentSpan && fromName && toName ? toName : null;
   const currentSend = currentSpan && fromName && toName ? { from: fromName, to: toName, type: currentSpan.name, at: currentEvent.timeMs } : null;
   const positions = {
-    User: { x: 40, y: 120 },
-    LLM: { x: 320, y: 120 },
+    User: { x: 180, y: 120 },
+    LLM: { x: 460, y: 120 },
   };
   const roles = {
     User: 'P1',
     LLM: 'P2',
   };
 
-  const nodes = names.map((name) => {
+  const nodes = [{
+    id: '__turn__',
+    type: 'turn',
+    position: { x: 20, y: 80 },
+    data: { rows: turnRows, activeTurn },
+    style: { background: 'transparent', border: 'none', padding: 0, width: 'auto' },
+    draggable: false,
+    selectable: false,
+  }].concat(names.map((name) => {
     const ports = portsForService(name);
     return {
       id: name,
@@ -740,7 +792,7 @@ function FlowPanel({ sim, trace, stepIdx, setStepIdx }) {
       },
       style: { background: 'transparent', border: 'none', padding: 0, width: 'auto' },
     };
-  });
+  }));
 
   const primaryColor = 'oklch(56% 0.15 262)';
   const inkColor = 'oklch(22% 0.015 260)';
