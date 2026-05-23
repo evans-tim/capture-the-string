@@ -1,0 +1,960 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>cts simulation</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Inter+Tight:wght@400;500;600;700&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="https://unpkg.com/reactflow@11.11.4/dist/style.css" />
+    <script>window.VITE_OPENAI_API_KEY = localStorage.getItem('OPENAI_API_KEY') || '';</script>
+    <style>
+      :root {
+        --bg:           oklch(98.8% 0.003 250);
+        --surface:      oklch(100% 0 0);
+        --surface-alt:  oklch(97.2% 0.004 250);
+        --line:         oklch(91.5% 0.006 250);
+        --line-strong:  oklch(84% 0.008 250);
+        --ink:          oklch(22% 0.015 260);
+        --ink-2:        oklch(40% 0.012 260);
+        --ink-3:        oklch(58% 0.010 260);
+        --ink-4:        oklch(72% 0.008 260);
+
+        --primary:      oklch(56% 0.15 262);
+        --primary-ink:  oklch(40% 0.14 262);
+        --primary-soft: oklch(96% 0.02 262);
+        --good:         oklch(58% 0.14 155);
+        --good-soft:    oklch(96% 0.03 155);
+        --warn:         oklch(68% 0.14 68);
+        --warn-ink:     oklch(48% 0.13 55);
+        --warn-soft:    oklch(96% 0.04 85);
+        --mute:         oklch(70% 0.006 260);
+        --mute-soft:    oklch(95% 0.004 260);
+
+        --radius:       10px;
+        --radius-sm:    6px;
+        --radius-lg:    14px;
+        --shadow-sm:    0 1px 0 oklch(0% 0 0 / 0.03), 0 1px 2px oklch(0% 0 0 / 0.04);
+
+        --font-sans: 'Inter Tight', system-ui, -apple-system, sans-serif;
+        --font-mono: ui-monospace, 'SF Mono', 'Menlo', 'Monaco', 'Cascadia Code', 'Roboto Mono', 'Consolas', monospace;
+      }
+
+      * { box-sizing: border-box; }
+      html, body, #root { margin: 0; padding: 0; height: 100%; }
+      body {
+        font-family: var(--font-sans);
+        font-size: 14px;
+        line-height: 1.45;
+        color: var(--ink);
+        background: var(--bg);
+        -webkit-font-smoothing: antialiased;
+        text-rendering: optimizeLegibility;
+        font-feature-settings: "ss01", "cv11";
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="importmap">
+    {
+      "imports": {
+        "react": "https://esm.sh/react@18.2.0",
+        "react/jsx-runtime": "https://esm.sh/react@18.2.0/jsx-runtime",
+        "react-dom": "https://esm.sh/react-dom@18.2.0?deps=react@18.2.0",
+        "react-dom/client": "https://esm.sh/react-dom@18.2.0/client?deps=react@18.2.0",
+        "reactflow": "https://esm.sh/reactflow@11.11.4?deps=react@18.2.0,react-dom@18.2.0",
+        "@emotion/css": "https://esm.sh/@emotion/css@11.11.2",
+        "ai": "https://esm.sh/ai@3.4.33",
+        "@ai-sdk/openai": "https://esm.sh/@ai-sdk/openai@0.0.72?deps=ai@3.4.33"
+      }
+    }
+    </script>
+    <script type="text/babel" data-type="module" data-presets="typescript,react">
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import { createRoot } from 'react-dom/client';
+import { css } from '@emotion/css';
+import ReactFlow, { Background, BackgroundVariant, Controls, Handle, MarkerType, Position } from 'reactflow';
+import { generateText } from 'ai';
+import { createOpenAI } from '@ai-sdk/openai';
+
+// ===================== simulation engine =====================
+
+class IndexedDbSink {
+  constructor() {
+    this.dbName = 'cts-traces';
+    this.storeName = 'entries';
+    this.dbPromise = null;
+  }
+  getDb() {
+    if (typeof indexedDB === 'undefined') return null;
+    if (this.dbPromise) return this.dbPromise;
+    this.dbPromise = new Promise((resolve, reject) => {
+      const req = indexedDB.open(this.dbName, 1);
+      req.onupgradeneeded = () => {
+        const db = req.result;
+        if (!db.objectStoreNames.contains(this.storeName)) {
+          db.createObjectStore(this.storeName, { autoIncrement: true });
+        }
+      };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+    return this.dbPromise;
+  }
+  append(entry) {
+    const dbp = this.getDb();
+    if (!dbp) return;
+    dbp.then((db) => {
+      const tx = db.transaction(this.storeName, 'readwrite');
+      tx.objectStore(this.storeName).add(entry);
+    }).catch(() => undefined);
+  }
+  async all() {
+    const dbp = this.getDb();
+    if (!dbp) return [];
+    const db = await dbp;
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(this.storeName, 'readonly');
+      const req = tx.objectStore(this.storeName).getAll();
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  }
+  async clear() {
+    const dbp = this.getDb();
+    if (!dbp) return;
+    const db = await dbp;
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(this.storeName, 'readwrite');
+      const req = tx.objectStore(this.storeName).clear();
+      req.onsuccess = () => resolve();
+      req.onerror = () => reject(req.error);
+    });
+  }
+}
+
+class TraceLog {
+  constructor() { this.entries = []; this.listeners = []; this.sink = undefined; }
+  setSink(sink) { this.sink = sink; }
+  getSink() { return this.sink; }
+  record(entry) {
+    this.entries.push(entry);
+    if (this.sink) this.sink.append(entry);
+    for (const l of this.listeners) l(entry);
+  }
+  all() { return this.entries.slice(); }
+  subscribe(listener) { this.listeners.push(listener); }
+}
+
+class Service {
+  constructor(name) {
+    this.name = name;
+    this.state = {};
+  }
+  attach(sim) { this.sim = sim; }
+  getState() { return { ...this.state }; }
+  setState(next) {
+    this.state = { ...this.state, ...next };
+    this.sim.trace.record({ kind: 'state', at: this.sim.now(), service: this.name, state: this.getState() });
+  }
+  send(to, type, payload, traceId, parentSpanId) {
+    const ctx = this.sim.currentContext();
+    const tid = traceId ?? ctx?.traceId ?? this.sim.newTraceId();
+    const parent = parentSpanId ?? ctx?.spanId;
+    this.sim.send({
+      traceId: tid,
+      spanId: this.sim.newSpanId(),
+      parentSpanId: parent,
+      from: this.name, to, type, payload,
+    });
+  }
+  handle(_message) {}
+}
+
+class Simulation {
+  constructor() {
+    this.trace = new TraceLog();
+    this.services = new Map();
+    this.queue = [];
+    this.clock = 0;
+    this.traceCounter = 0;
+    this.spanCounter = 0;
+    this.queueListeners = [];
+    this.drainScheduled = false;
+    this.handlingStack = [];
+  }
+  tick() { this.clock += 1; }
+  register(service) {
+    service.attach(this);
+    this.services.set(service.name, service);
+  }
+  get(name) {
+    const service = this.services.get(name);
+    if (!service) throw new Error(`Unknown service: ${name}`);
+    return service;
+  }
+  serviceNames() { return Array.from(this.services.keys()); }
+  now() { return this.clock; }
+  newTraceId() { this.traceCounter += 1; return `t${this.traceCounter}`; }
+  newSpanId() { this.spanCounter += 1; return `s${this.spanCounter}`; }
+  currentContext() { return this.handlingStack[this.handlingStack.length - 1]; }
+  send(message) {
+    this.clock += 1;
+    this.trace.record({
+      kind: 'send', at: this.clock,
+      traceId: message.traceId, spanId: message.spanId, parentSpanId: message.parentSpanId,
+      from: message.from, to: message.to, type: message.type, payload: message.payload,
+    });
+    this.queue.push(message);
+    this.emitQueue();
+  }
+  onQueueChange(listener) { this.queueListeners.push(listener); }
+  emitQueue() {
+    const snapshot = this.queue.slice();
+    for (const l of this.queueListeners) l(snapshot);
+  }
+  step() {
+    const message = this.queue.shift();
+    if (!message) return false;
+    this.emitQueue();
+    this.clock += 1;
+    const target = this.services.get(message.to);
+    if (!target) {
+      this.trace.record({ kind: 'error', at: this.clock, traceId: message.traceId, error: `No service: ${message.to}` });
+      return true;
+    }
+    const startedAt = this.clock;
+    this.trace.record({
+      kind: 'handle', at: startedAt,
+      traceId: message.traceId, spanId: message.spanId, parentSpanId: message.parentSpanId,
+      service: message.to, type: message.type, payload: message.payload,
+    });
+    this.handlingStack.push({ traceId: message.traceId, spanId: message.spanId });
+    try {
+      target.handle(message);
+      this.trace.record({
+        kind: 'span', traceId: message.traceId, spanId: message.spanId, parentSpanId: message.parentSpanId,
+        name: `${message.to}.handle ${message.type}`, service: message.to, spanKind: 'handle',
+        startedAt, endedAt: this.clock,
+        attributes: { messageType: message.type, from: message.from }, status: 'ok',
+      });
+    } catch (error) {
+      const err = error instanceof Error ? error.message : String(error);
+      this.trace.record({ kind: 'error', at: this.clock, traceId: message.traceId, spanId: message.spanId, service: message.to, error: err });
+      this.trace.record({
+        kind: 'span', traceId: message.traceId, spanId: message.spanId, parentSpanId: message.parentSpanId,
+        name: `${message.to}.handle ${message.type}`, service: message.to, spanKind: 'handle',
+        startedAt, endedAt: this.clock,
+        attributes: { messageType: message.type, from: message.from }, status: 'error', error: err,
+      });
+    } finally {
+      this.handlingStack.pop();
+    }
+    return true;
+  }
+  drain(maxSteps = 1000) {
+    let n = 0;
+    while (this.step()) {
+      n += 1;
+      if (n >= maxSteps) break;
+    }
+  }
+  scheduleDrain() {
+    if (this.drainScheduled) return;
+    this.drainScheduled = true;
+    queueMicrotask(() => { this.drainScheduled = false; this.drain(); });
+  }
+  startSpan(opts) {
+    const ctx = this.currentContext();
+    const traceId = opts.traceId ?? ctx?.traceId ?? this.newTraceId();
+    const parentSpanId = opts.parentSpanId ?? ctx?.spanId;
+    const spanId = this.newSpanId();
+    const startedAt = this.now();
+    const base = { ...(opts.attributes ?? {}) };
+    return {
+      spanId, traceId,
+      end: ({ status, error, attributes }) => {
+        const endedAt = this.now();
+        this.trace.record({
+          kind: 'span', traceId, spanId, parentSpanId,
+          name: opts.name, service: opts.service, spanKind: opts.spanKind,
+          startedAt, endedAt,
+          attributes: { ...base, ...(attributes ?? {}) },
+          status, error,
+        });
+      },
+    };
+  }
+}
+
+class UserService extends Service {
+  constructor() {
+    super('User');
+  }
+  userChat(text) {
+    this.setState({ lastChat: text });
+    this.send('LLM', 'chat', { text });
+  }
+  handle(message) {
+    if (message.type === 'chat_result') {
+      this.setState({ lastChat: message.payload });
+    }
+  }
+}
+
+class LLMService extends Service {
+  constructor() {
+    super('LLM');
+  }
+  handle(message) {
+    if (message.type === 'chat') {
+      const { text } = message.payload;
+      this.callLlm(text, message.traceId);
+    }
+  }
+
+  callLlm(text, traceId) {
+    const apiKey = window.VITE_OPENAI_API_KEY || '';
+    const openai = createOpenAI({ apiKey });
+    const prompt = text;
+    const model = 'gpt-4o-mini';
+    const span = this.sim.startSpan({
+      traceId,
+      name: 'conductor.llm.reply',
+      service: this.name,
+      spanKind: 'llm',
+      attributes: { model, promptChars: prompt.length },
+    });
+    generateText({ model: openai(model), prompt })
+      .then((result) => {
+        span.end({ status: 'ok', attributes: { responseChars: result.text.length } });
+        this.send('User', 'chat_result', { text: result.text }, traceId, span.spanId);
+        this.sim.scheduleDrain();
+      })
+      .catch((error) => {
+        const msg = error instanceof Error ? error.message : String(error);
+        span.end({ status: 'error', error: msg });
+        this.send('User', 'chat_result', { error: msg }, traceId, span.spanId);
+        this.sim.scheduleDrain();
+      });
+  }
+}
+
+function buildSimulation() {
+  const sim = new Simulation();
+  sim.trace.setSink(new IndexedDbSink());
+  sim.register(new UserService());
+  sim.register(new LLMService());
+  return sim;
+}
+
+// ===================== React UI =====================
+
+function useSim() {
+  const [sim] = useState(() => buildSimulation());
+  const [trace, setTrace] = useState(() => sim.trace.all());
+  const [queue, setQueue] = useState([]);
+
+  useEffect(() => {
+    sim.trace.subscribe(() => setTrace(sim.trace.all()));
+    sim.onQueueChange((q) => setQueue(q));
+  }, [sim]);
+
+  const reset = useCallback(() => { window.location.reload(); }, []);
+
+  return { sim, trace, queue, reset };
+}
+
+const panelClass = css`
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-sm);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  height: 100%;
+  min-height: 0;
+`;
+const panelHeadClass = css`
+  padding: 11px 16px;
+  border-bottom: 1px solid var(--line);
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--ink-3);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  background: var(--surface);
+`;
+const panelBodyClass = css`
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+`;
+
+function Panel({ title, children, bodyStyle, headerRight }) {
+  return (
+    <div className={panelClass}>
+      <div className={panelHeadClass} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+        <span>{title}</span>
+        {headerRight}
+      </div>
+      <div className={panelBodyClass} style={bodyStyle}>{children}</div>
+    </div>
+  );
+}
+
+const btnClass = css`
+  display: inline-flex; align-items: center; gap: 7px;
+  padding: 5px 10px; border-radius: 7px;
+  font: inherit; font-size: 12.5px; font-weight: 500;
+  background: var(--surface); color: var(--ink);
+  border: 1px solid var(--line-strong);
+  cursor: pointer;
+  &:hover { background: var(--surface-alt); }
+`;
+const btnPrimaryClass = css`
+  background: var(--ink); color: white; border-color: var(--ink);
+  &:hover { background: oklch(30% 0.015 260); }
+`;
+const btnAccentClass = css`
+  background: var(--primary); color: white; border-color: var(--primary);
+  &:hover { background: var(--primary-ink); border-color: var(--primary-ink); }
+`;
+
+function Button({ children, variant = 'default', onClick }) {
+  const cls = variant === 'primary' ? `${btnClass} ${btnPrimaryClass}` : variant === 'accent' ? `${btnClass} ${btnAccentClass}` : btnClass;
+  return <button className={cls} onClick={onClick}>{children}</button>;
+}
+
+const badgeBaseClass = css`
+  display: inline-flex; align-items: center;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  border: 1px solid transparent;
+`;
+
+function badgeStyle(kind) {
+  const base = badgeBaseClass;
+  switch (kind) {
+    case 'send': return `${base} ${css`background: var(--primary-soft); color: var(--primary-ink);`}`;
+    case 'handle': return `${base} ${css`background: var(--good-soft); color: var(--good);`}`;
+    case 'state': return `${base} ${css`background: var(--warn-soft); color: var(--warn-ink);`}`;
+    case 'error': return `${base} ${css`background: var(--warn-soft); color: var(--warn-ink);`}`;
+    case 'span': return `${base} ${css`background: var(--mute-soft); color: var(--ink-2);`}`;
+    default: return `${base} ${css`background: var(--mute-soft); color: var(--ink-3);`}`;
+  }
+}
+
+function formatEntry(entry) {
+  if (entry.kind === 'send') return `${entry.from} -> ${entry.to} : ${entry.type} ${JSON.stringify(entry.payload)}`;
+  if (entry.kind === 'handle') return `${entry.service} handled ${entry.type} ${JSON.stringify(entry.payload)}`;
+  if (entry.kind === 'state') return JSON.stringify(entry.state);
+  if (entry.kind === 'error') return entry.error;
+  if (entry.kind === 'span') return `${entry.name} [${entry.spanKind}] ${entry.status}${entry.error ? ` ${entry.error}` : ''} ${JSON.stringify(entry.attributes)}`;
+  return '';
+}
+
+const servicePairs = [
+  { a: 'User', b: 'LLM', bidirectional: true, sideA: Position.Right, sideB: Position.Left },
+];
+
+function portsForService(name) {
+  const ports = [];
+  for (const pair of servicePairs) {
+    if (pair.a === name) ports.push({ peer: pair.b, side: pair.sideA });
+    else if (pair.b === name) ports.push({ peer: pair.a, side: pair.sideB });
+  }
+  return ports;
+}
+
+function portId(peer) { return `port:${peer}`; }
+
+const nodeCardClass = css`
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  padding: 10px 14px;
+  min-width: 120px;
+  color: var(--ink);
+  font-size: 13px;
+  font-weight: 600;
+  text-align: center;
+  box-shadow: var(--shadow-sm);
+`;
+const nodeCardActiveClass = css`
+  border-color: var(--primary);
+  box-shadow: 0 0 0 2px var(--primary-soft);
+`;
+const roleClass = css`
+  color: var(--ink-3);
+  font-size: 10px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  margin-bottom: 4px;
+`;
+
+function ServiceNode({ data }) {
+  const sideCounts = {
+    [Position.Top]: 0,
+    [Position.Bottom]: 0,
+    [Position.Left]: 0,
+    [Position.Right]: 0,
+  };
+  for (const p of data.ports) sideCounts[p.side] += 1;
+  const sideIndex = {
+    [Position.Top]: 0,
+    [Position.Bottom]: 0,
+    [Position.Left]: 0,
+    [Position.Right]: 0,
+  };
+  return (
+    <div className={`${nodeCardClass} ${data.active ? nodeCardActiveClass : ''}`} style={{ position: 'relative' }}>
+      <div className={roleClass}>{data.role}</div>
+      <div>{data.name}</div>
+      {data.ports.map((port) => {
+        const total = sideCounts[port.side];
+        const idx = sideIndex[port.side];
+        sideIndex[port.side] = idx + 1;
+        const offsetPct = ((idx + 1) / (total + 1)) * 100;
+        const isVertical = port.side === Position.Top || port.side === Position.Bottom;
+        const positionStyle = isVertical ? { left: `${offsetPct}%` } : { top: `${offsetPct}%` };
+        const dotStyle = { ...positionStyle, width: 7, height: 7, background: 'var(--ink-4)', border: 'none' };
+        const overlayStyle = { ...positionStyle, width: 7, height: 7, background: 'transparent', border: 'none', opacity: 0 };
+        const id = portId(port.peer);
+        return (
+          <React.Fragment key={`${port.peer}-${port.side}`}>
+            <Handle id={id} type="source" position={port.side} style={dotStyle} isConnectable={false} />
+            <Handle id={id} type="target" position={port.side} style={overlayStyle} isConnectable={false} />
+          </React.Fragment>
+        );
+      })}
+    </div>
+  );
+}
+
+const nodeTypes = { service: ServiceNode };
+
+const activeEdgeForwardClass = css`
+  .react-flow__edge-path {
+    stroke-dasharray: 8 6;
+    animation: edge-flow-forward 650ms linear infinite;
+  }
+  @keyframes edge-flow-forward {
+    from { stroke-dashoffset: 14; }
+    to { stroke-dashoffset: 0; }
+  }
+`;
+
+const activeEdgeReverseClass = css`
+  .react-flow__edge-path {
+    stroke-dasharray: 8 6;
+    animation: edge-flow-reverse 650ms linear infinite;
+  }
+  @keyframes edge-flow-reverse {
+    from { stroke-dashoffset: 0; }
+    to { stroke-dashoffset: 14; }
+  }
+`;
+
+function mostRecentTraceOnly(trace) {
+  let lastTraceId;
+  for (let i = trace.length - 1; i >= 0; i -= 1) {
+    const e = trace[i];
+    if ('traceId' in e && e.traceId) { lastTraceId = e.traceId; break; }
+  }
+  if (!lastTraceId) return [];
+  return trace.filter((e) => 'traceId' in e && e.traceId === lastTraceId);
+}
+
+function FlowPanel({ sim, trace, showAll }) {
+  const names = sim.serviceNames();
+  const scopedTrace = useMemo(() => (showAll ? trace : mostRecentTraceOnly(trace)), [trace, showAll]);
+  const sendEntries = useMemo(() => scopedTrace.filter((e) => e.kind === 'send'), [scopedTrace]);
+  const [stepIdx, setStepIdx] = useState(-1);
+
+  useEffect(() => { setStepIdx(sendEntries.length - 1); }, [sendEntries.length]);
+
+  const currentSend = stepIdx >= 0 && stepIdx < sendEntries.length ? sendEntries[stepIdx] : null;
+  const activeName = currentSend ? currentSend.to : null;
+  const positions = {
+    User: { x: 40, y: 120 },
+    LLM: { x: 320, y: 120 },
+  };
+  const roles = {
+    User: 'P1',
+    LLM: 'P2',
+  };
+
+  const nodes = names.map((name) => {
+    const ports = portsForService(name);
+    return {
+      id: name,
+      type: 'service',
+      position: positions[name] ?? { x: 0, y: 0 },
+      data: {
+        name,
+        role: roles[name] ?? 'SERVICE',
+        active: name === activeName,
+        ports,
+      },
+      style: { background: 'transparent', border: 'none', padding: 0, width: 'auto' },
+    };
+  });
+
+  const primaryColor = 'oklch(56% 0.15 262)';
+  const inkColor = 'oklch(22% 0.015 260)';
+  const surfaceColor = 'oklch(100% 0 0)';
+  const muteColor = 'oklch(72% 0.008 260)';
+
+  const edges = [];
+  for (const pair of servicePairs) {
+    const matchesAtoB = !!(currentSend && currentSend.from === pair.a && currentSend.to === pair.b);
+    const matchesBtoA = !!(currentSend && currentSend.from === pair.b && currentSend.to === pair.a);
+    const isActive = matchesAtoB || matchesBtoA;
+    const stroke = isActive ? primaryColor : muteColor;
+    edges.push({
+      id: `${pair.a}<->${pair.b}`,
+      source: pair.a,
+      target: pair.b,
+      sourceHandle: portId(pair.b),
+      targetHandle: portId(pair.a),
+      type: pair.edgeType ?? 'smoothstep',
+      label: isActive && currentSend ? currentSend.type : undefined,
+      animated: false,
+      className: isActive ? (matchesBtoA ? activeEdgeReverseClass : activeEdgeForwardClass) : undefined,
+      markerEnd: { type: MarkerType.ArrowClosed, color: matchesAtoB ? primaryColor : muteColor },
+      markerStart: pair.bidirectional ? { type: MarkerType.ArrowClosed, color: matchesBtoA ? primaryColor : muteColor } : undefined,
+      style: { stroke, strokeWidth: 1.5 },
+      labelStyle: { fill: inkColor, fontSize: 11, fontFamily: 'var(--font-mono)' },
+      labelBgStyle: { fill: surfaceColor },
+    });
+  }
+
+  const headerClass = css`
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 14px;
+    border-bottom: 1px solid var(--line);
+    background: var(--surface);
+    font-size: 12px;
+    color: var(--ink-2);
+  `;
+  const sliderClass = css`
+    flex: 1;
+    accent-color: var(--primary);
+  `;
+  const stepLabelClass = css`
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    color: var(--ink-3);
+    width: 220px;
+    flex-shrink: 0;
+    text-align: right;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  `;
+
+  return (
+    <Panel title="Service Flow" bodyStyle={{ display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+      <div className={headerClass}>
+        <span>Step</span>
+        <input
+          className={sliderClass}
+          type="range"
+          min={-1}
+          max={Math.max(sendEntries.length - 1, -1)}
+          step={1}
+          value={stepIdx}
+          onChange={(e) => setStepIdx(Number(e.target.value))}
+          disabled={sendEntries.length === 0}
+        />
+        <span className={stepLabelClass}>
+          {currentSend ? `t=${currentSend.at} ${currentSend.from}→${currentSend.to}` : sendEntries.length === 0 ? 'no scenario' : 'start'}
+        </span>
+      </div>
+      <div style={{ flex: 1, minHeight: 0, width: '100%', background: 'var(--surface-alt)' }}>
+        <ReactFlow
+          nodes={nodes}
+          edges={edges}
+          nodeTypes={nodeTypes}
+          fitView
+          nodesDraggable={false}
+          nodesConnectable={false}
+          elementsSelectable={false}
+          panOnDrag
+          zoomOnScroll
+        >
+          <Background variant={BackgroundVariant.Dots} color="oklch(84% 0.008 250)" gap={16} size={1.5} />
+          <Controls showInteractive={false} />
+        </ReactFlow>
+      </div>
+    </Panel>
+  );
+}
+
+function LogsPanel({ trace, showAll, onToggleShowAll }) {
+  const shown = showAll ? trace : mostRecentTraceOnly(trace);
+  const row = css`
+    display: grid;
+    grid-template-columns: 50px 80px 70px 60px 60px 90px 1fr;
+    gap: 8px;
+    padding: 6px 14px;
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    color: var(--ink-2);
+    border-bottom: 1px dashed var(--line);
+    align-items: center;
+    &:last-child { border-bottom: none; }
+  `;
+  const at = css`color: var(--ink-4);`;
+  const dim = css`color: var(--ink-4);`;
+  const empty = css`padding: 16px; color: var(--ink-3); font-style: italic; font-size: 13px;`;
+  const head = css`
+    display: grid;
+    grid-template-columns: 50px 80px 70px 60px 60px 90px 1fr;
+    gap: 8px;
+    padding: 6px 14px;
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    color: var(--ink-3);
+    border-bottom: 1px solid var(--line);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  `;
+  const atOf = (e) => ('at' in e ? e.at : 'startedAt' in e ? e.startedAt : undefined);
+  return (
+    <Panel
+      title="Trace Log"
+      headerRight={
+        <label style={{ display: 'inline-flex', alignItems: 'center', gap: 6, textTransform: 'none', letterSpacing: 0, fontWeight: 500 }}>
+          <input type="checkbox" checked={showAll} onChange={(e) => onToggleShowAll(e.target.checked)} />
+          show all traces
+        </label>
+      }
+    >
+      {shown.length === 0 ? (
+        <div className={empty}>No events yet. Send a message.</div>
+      ) : (
+        <>
+          <div className={head}>
+            <span>t</span>
+            <span>kind</span>
+            <span>trace</span>
+            <span>span</span>
+            <span>parent</span>
+            <span>service</span>
+            <span>detail</span>
+          </div>
+          {shown.map((entry, i) => {
+            const t = atOf(entry);
+            const traceId = 'traceId' in entry ? entry.traceId : '';
+            const spanId = 'spanId' in entry ? entry.spanId : '';
+            const parentSpanId = 'parentSpanId' in entry ? entry.parentSpanId : '';
+            const service = ('service' in entry && entry.service) || ('from' in entry && typeof entry.from === 'string' && entry.from) || '';
+            return (
+              <div key={i} className={row}>
+                <span className={at}>{t !== undefined ? `t=${t}` : ''}</span>
+                <span><span className={badgeStyle(entry.kind)}>{entry.kind}</span></span>
+                <span>{traceId || ''}</span>
+                <span className={dim}>{spanId || ''}</span>
+                <span className={dim}>{parentSpanId || ''}</span>
+                <span>{service}</span>
+                <span>{formatEntry(entry)}</span>
+              </div>
+            );
+          })}
+        </>
+      )}
+    </Panel>
+  );
+}
+
+
+function FrontendPanel({ sim, trace }) {
+  const [chat, setChat] = useState('');
+
+  const lastChat = [...trace].reverse().find(
+    (e) => e.kind === 'handle' && e.service === 'User' && e.type === 'chat_result'
+  );
+
+  const windowClass = css`
+    margin: 14px;
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    background: var(--surface);
+    overflow: hidden;
+    box-shadow: var(--shadow-sm);
+  `;
+  const titleBar = css`
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 8px 12px;
+    background: var(--surface-alt);
+    border-bottom: 1px solid var(--line);
+    font-size: 12px;
+    color: var(--ink-3);
+  `;
+  const dotRed = css`width: 10px; height: 10px; border-radius: 50%; background: oklch(65% 0.18 25);`;
+  const dotYellow = css`width: 10px; height: 10px; border-radius: 50%; background: var(--warn);`;
+  const dotGreen = css`width: 10px; height: 10px; border-radius: 50%; background: var(--good);`;
+  const body = css`
+    padding: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    color: var(--ink);
+  `;
+  const labelClass = css`font-size: 11.5px; color: var(--ink-3); text-transform: uppercase; letter-spacing: 0.06em; font-weight: 500;`;
+  const inputClass = css`
+    background: var(--surface);
+    border: 1px solid var(--line-strong);
+    border-radius: var(--radius-sm);
+    color: var(--ink);
+    padding: 7px 10px;
+    font: inherit;
+    font-size: 13px;
+    width: 100%;
+    box-sizing: border-box;
+    &:focus { outline: 2px solid var(--primary); outline-offset: -1px; }
+  `;
+  const result = css`
+    margin-top: 4px;
+    padding: 10px 12px;
+    background: var(--surface-alt);
+    border: 1px solid var(--line);
+    border-radius: var(--radius-sm);
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    color: var(--ink-2);
+  `;
+  const rowClass = css`display: flex; gap: 8px; flex-wrap: wrap;`;
+
+  const sendChat = () => {
+    const presence = sim.get('User');
+    presence.userChat(chat);
+    sim.drain();
+    setChat('');
+  };
+
+  return (
+    <Panel title="Frontend">
+      <div className={windowClass}>
+        <div className={titleBar}>
+          <span className={dotRed} />
+          <span className={dotYellow} />
+          <span className={dotGreen} />
+          <span style={{ marginLeft: 6 }}>app</span>
+        </div>
+        <div className={body}>
+          <label className={labelClass}>Chat (LLM)</label>
+          <input
+            className={inputClass}
+            value={chat}
+            onChange={(e) => setChat(e.target.value)}
+            onKeyDown={(e) => { if (e.key === 'Enter') sendChat(); }}
+            placeholder="say something..."
+          />
+          <div className={rowClass}>
+            <Button variant="accent" onClick={sendChat}>Send</Button>
+          </div>
+          {lastChat && (
+            <div className={result}>{JSON.stringify(lastChat.payload)}</div>
+          )}
+        </div>
+      </div>
+    </Panel>
+  );
+}
+
+const topbarClass = css`
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 10px 24px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--line);
+`;
+const brandClass = css`
+  display: flex; align-items: center; gap: 10px;
+  font-weight: 600; letter-spacing: -0.01em;
+  font-size: 14.5px; color: var(--ink);
+`;
+const logoClass = css`
+  width: 22px; height: 22px; border-radius: 6px;
+  background: var(--ink);
+  display: grid; place-items: center;
+  color: white; font-family: var(--font-mono); font-size: 12px; font-weight: 600;
+`;
+const gridClass = css`
+  flex: 1;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 2fr);
+  grid-template-rows: 1.4fr 1fr;
+  gap: 14px;
+  padding: 14px;
+  min-height: 0;
+  background: var(--bg);
+`;
+
+function App() {
+  const { sim, trace, reset } = useSim();
+  const [showAll, setShowAll] = useState(false);
+
+  const exportTrace = useCallback(async () => {
+    const sink = sim.trace.getSink();
+    const entries = sink ? await sink.all() : sim.trace.all();
+    const ndjson = entries.map((e) => JSON.stringify(e)).join('\n');
+    const blob = new Blob([ndjson], { type: 'application/x-ndjson' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `cts-trace-${Date.now()}.ndjson`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }, [sim]);
+
+  return (
+    <div style={{ height: '100vh', display: 'flex', flexDirection: 'column', background: 'var(--bg)' }}>
+      <div className={topbarClass}>
+        <span className={brandClass}>
+          <span className={logoClass}>cts</span>
+          Capture the String
+        </span>
+        <div style={{ display: 'flex', gap: 8 }}>
+          <Button onClick={exportTrace}>Export trace</Button>
+          <Button onClick={reset}>Reset</Button>
+        </div>
+      </div>
+      <div className={gridClass}>
+        <div style={{ gridRow: '1 / 2', gridColumn: '1 / 2', minHeight: 0 }}>
+          <FrontendPanel sim={sim} trace={trace} />
+        </div>
+        <div style={{ gridRow: '1 / 2', gridColumn: '2 / 3', minHeight: 0 }}>
+          <FlowPanel sim={sim} trace={trace} showAll={showAll} />
+        </div>
+        <div style={{ gridRow: '2 / 3', gridColumn: '1 / 3', minHeight: 0 }}>
+          <LogsPanel trace={trace} showAll={showAll} onToggleShowAll={setShowAll} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+const rootElement = document.getElementById('root');
+if (!rootElement) throw new Error('Missing root element');
+createRoot(rootElement).render(<App />);
+    </script>
+    <script src="https://unpkg.com/@babel/standalone@7.25.6/babel.min.js"></script>
+  </body>
+</html>
