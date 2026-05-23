@@ -377,13 +377,14 @@ class UserService extends Service {
     this.startTurn();
   }
   startTurn() {
-    const { turnIdx, turns, transcript, seedPrompt, gameCtx } = this.state;
+    const { turnIdx, turns, transcript, seedPrompt, target, gameCtx } = this.state;
     if (turnIdx >= turns) return;
     const tracer = this.sim.tracer;
     const turnSpan = tracer.startSpan(`cts.turn`, { attributes: { 'cts.turnIdx': turnIdx } }, gameCtx);
     const turnCtx = otelTrace.setSpan(gameCtx, turnSpan);
     const messages = [
       { role: 'system', content: seedPrompt },
+      { role: 'system', content: `Target: ${target}` },
       ...transcript.map((t) => ({ role: 'assistant', content: t })),
     ];
     const promptSpan = tracer.startSpan('cts.prompt', { attributes: { 'chat.from': 'User', 'chat.to': 'LLM', 'cts.turnIdx': turnIdx, 'cts.messages': JSON.stringify(messages) } }, turnCtx);
