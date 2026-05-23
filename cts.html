@@ -730,7 +730,20 @@ function MessagesNode({ data }) {
   );
 }
 
-const nodeTypes = { service: ServiceNode, turn: TurnNode, messages: MessagesNode };
+function ResponseNode({ data }) {
+  return (
+    <div className={messagesNodeClass} style={{ transform: 'translateY(-50%)' }}>
+      <div className={roleClass}>Response</div>
+      {data.response == null ? (
+        <div className={messageRowClass} style={{ color: 'var(--ink-4)', fontStyle: 'italic' }}>pending</div>
+      ) : (
+        <div className={messageRowClass}>{data.response}</div>
+      )}
+    </div>
+  );
+}
+
+const nodeTypes = { service: ServiceNode, turn: TurnNode, messages: MessagesNode, response: ResponseNode };
 
 const activeEdgeForwardClass = css`
   .react-flow__edge-path {
@@ -804,6 +817,15 @@ function FlowPanel({ sim, trace, stepIdx, setStepIdx }) {
       break;
     }
   }
+  let currentResponse = null;
+  for (let i = stepIdx; i >= 0; i -= 1) {
+    const ev = spanEvents[i];
+    if (ev?.type !== 'end') continue;
+    if (ev.span?.name !== 'cts.response') continue;
+    if (ev.span.attributes?.['cts.turnIdx'] !== activeTurn) continue;
+    const out = ev.span.attributes?.['cts.output'];
+    if (typeof out === 'string') { currentResponse = out; break; }
+  }
   const turnsAttr = scopedSpans.find((s) => typeof s.attributes?.['cts.turns'] === 'number')?.attributes?.['cts.turns'] ?? 5;
   const turnRows = Array.from({ length: turnsAttr }, (_, i) => i);
   const fromName = currentSpan?.attributes?.['chat.from'];
@@ -832,6 +854,14 @@ function FlowPanel({ sim, trace, stepIdx, setStepIdx }) {
     type: 'messages',
     position: { x: -60, y: 150 },
     data: { messages: currentMessages },
+    style: { background: 'transparent', border: 'none', padding: 0, width: 'auto' },
+    draggable: false,
+    selectable: false,
+  }, {
+    id: '__response__',
+    type: 'response',
+    position: { x: 700, y: 150 },
+    data: { response: currentResponse },
     style: { background: 'transparent', border: 'none', padding: 0, width: 'auto' },
     draggable: false,
     selectable: false,
