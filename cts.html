@@ -694,7 +694,7 @@ function FlowPanel({ sim, trace, showAll }) {
   const currentSpan = currentEvent?.span ?? null;
   const fromName = currentSpan?.attributes?.['chat.from'];
   const toName = currentSpan?.attributes?.['chat.to'];
-  const activeName = currentEvent?.type === 'start' ? toName : null;
+  const activeName = currentSpan && fromName && toName ? toName : null;
   const currentSend = currentSpan && fromName && toName ? { from: fromName, to: toName, type: currentSpan.name, at: currentEvent.timeMs } : null;
   const positions = {
     User: { x: 40, y: 120 },
