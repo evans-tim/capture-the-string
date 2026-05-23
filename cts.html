@@ -717,8 +717,8 @@ const messageRowClass = css`
 
 function MessagesNode({ data }) {
   return (
-    <div className={messagesNodeClass} style={{ transform: 'translateY(-50%)' }}>
-      <div className={roleClass}>Messages</div>
+    <div className={messagesNodeClass} style={{ transform: 'translateY(-50%)', position: 'relative' }}>
+      <div className={roleClass}>User · Messages</div>
       {data.messages.length === 0 ? (
         <div className={messageRowClass} style={{ color: 'var(--ink-4)', fontStyle: 'italic' }}>none</div>
       ) : data.messages.map((m, i) => (
@@ -726,19 +726,23 @@ function MessagesNode({ data }) {
           <span style={{ color: 'var(--ink-4)' }}>{m.role}: </span>{m.content}
         </div>
       ))}
+      <Handle id={portId('LLM')} type="source" position={Position.Right} style={{ width: 7, height: 7, background: 'var(--ink-4)', border: 'none' }} isConnectable={false} />
+      <Handle id={portId('LLM')} type="target" position={Position.Right} style={{ width: 7, height: 7, background: 'transparent', border: 'none', opacity: 0 }} isConnectable={false} />
     </div>
   );
 }
 
 function ResponseNode({ data }) {
   return (
-    <div className={messagesNodeClass} style={{ transform: 'translateY(-50%)' }}>
-      <div className={roleClass}>Response</div>
+    <div className={messagesNodeClass} style={{ transform: 'translateY(-50%)', position: 'relative' }}>
+      <div className={roleClass}>LLM · Response</div>
       {data.response == null ? (
         <div className={messageRowClass} style={{ color: 'var(--ink-4)', fontStyle: 'italic' }}>pending</div>
       ) : (
         <div className={messageRowClass}>{data.response}</div>
       )}
+      <Handle id={portId('User')} type="source" position={Position.Left} style={{ width: 7, height: 7, background: 'var(--ink-4)', border: 'none' }} isConnectable={false} />
+      <Handle id={portId('User')} type="target" position={Position.Left} style={{ width: 7, height: 7, background: 'transparent', border: 'none', opacity: 0 }} isConnectable={false} />
     </div>
   );
 }
@@ -778,7 +782,6 @@ function mostRecentTraceOnly(trace) {
 }
 
 function FlowPanel({ sim, trace, stepIdx, setStepIdx }) {
-  const names = sim.serviceNames();
   const allOtel = useMemo(() => trace.filter((e) => e.kind === 'otel'), [trace]);
   const scopedSpans = useMemo(() => {
     if (allOtel.length === 0) return allOtel;
@@ -830,16 +833,7 @@ function FlowPanel({ sim, trace, stepIdx, setStepIdx }) {
   const turnRows = Array.from({ length: turnsAttr }, (_, i) => i);
   const fromName = currentSpan?.attributes?.['chat.from'];
   const toName = currentSpan?.attributes?.['chat.to'];
-  const activeName = currentSpan && fromName && toName ? toName : null;
   const currentSend = currentSpan && fromName && toName ? { from: fromName, to: toName, type: currentSpan.name, at: currentEvent.timeMs } : null;
-  const positions = {
-    User: { x: 180, y: 120 },
-    LLM: { x: 460, y: 120 },
-  };
-  const roles = {
-    User: 'P1',
-    LLM: 'P2',
-  };
 
   const nodes = [{
     id: '__turn__',
@@ -850,36 +844,22 @@ function FlowPanel({ sim, trace, stepIdx, setStepIdx }) {
     draggable: false,
     selectable: false,
   }, {
-    id: '__messages__',
+    id: 'User',
     type: 'messages',
-    position: { x: -60, y: 150 },
+    position: { x: 40, y: 180 },
     data: { messages: currentMessages },
     style: { background: 'transparent', border: 'none', padding: 0, width: 'auto' },
     draggable: false,
     selectable: false,
   }, {
-    id: '__response__',
+    id: 'LLM',
     type: 'response',
-    position: { x: 700, y: 150 },
+    position: { x: 460, y: 180 },
     data: { response: currentResponse },
     style: { background: 'transparent', border: 'none', padding: 0, width: 'auto' },
     draggable: false,
     selectable: false,
-  }].concat(names.map((name) => {
-    const ports = portsForService(name);
-    return {
-      id: name,
-      type: 'service',
-      position: positions[name] ?? { x: 0, y: 0 },
-      data: {
-        name,
-        role: roles[name] ?? 'SERVICE',
-        active: name === activeName,
-        ports,
-      },
-      style: { background: 'transparent', border: 'none', padding: 0, width: 'auto' },
-    };
-  }));
+  }];
 
   const primaryColor = 'oklch(56% 0.15 262)';
   const inkColor = 'oklch(22% 0.015 260)';
