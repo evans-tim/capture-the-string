@@ -1,9 +1,26 @@
-Capture the String (CTS) is a simple LLM eval game. Following von Neumann, we start with the one-person case: a pure maximization problem with no opponent.
+Capture the String (CTS) is a single-player LLM eval game. We start with the single-player case: turn minimization problem with no opponent. The "player" is just a single LLM. 
 
-In the single-player game, a fixed target string is chosen in advance, along with a turn budget that caps how long the game can run. A single player takes turns emitting one message per turn, and the running transcript of everything the player has said so far accumulates as the game's context. The game resolves to a payoff of either +1 or -1.
+A fixed target string and turn budget are set before play. Each turn the player emits one message; prior messages accumulate as context. Payoff is +1 or -1.
 
-Termination is straightforward: the game ends the first turn the player's message exactly matches the target (a win, payoff +1), or when the budget runs out without a match (a loss, payoff -1).
+The game ends the first turn the player's message exactly matches the target (+1), or when the budget runs out without a match (-1).
 
-To instantiate a game, you pick a concrete target, budget, and player — for example, target "hello world", budget 5, player GPT-4. That tuple alone doesn't fully specify behavior, though, since it leaves open what the player actually sees on each turn.
+## Implementation (`cts.html`)
 
-The game engine is what fills that gap: it drives turns, decides what context the player is shown, and adjudicates termination. Open questions include whether the player sees a system prompt explaining the rules, whether it sees its own prior outputs, and how the win-check is performed (exact match, normalized, etc.).
+Open `cts.html` in a browser. Set `OPENAI_API_KEY` in localStorage.
+
+Game parameters:
+
+- **target** — string to match (default: `hello world!`)
+- **seedPrompt** — system prompt sent every turn
+- **turns** — turn budget (default: 12)
+- **hideTarget** — omit `Target: …` from LLM context when checked
+
+Each turn the User service sends the LLM:
+
+1. seed prompt (system)
+2. target string (system), unless hidden
+3. prior outputs (assistant)
+
+The LLM (`gpt-4o-mini`) returns one message. User checks exact equality against the target, appends the output to the transcript, and continues or stops.
+
+User and LLM are two services in a message-passing simulation. Traces are OpenTelemetry spans (`cts.game`, `cts.turn`, `cts.response`). The UI shows the game board, a step-through service-flow view, and a trace log.
