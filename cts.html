@@ -730,9 +730,19 @@ function MessagesNode({ data }) {
   );
 }
 
+const responseNodeWinClass = css`
+  border-color: var(--good);
+  box-shadow: 0 0 0 2px var(--good-soft);
+`;
+const responseNodeLossClass = css`
+  border-color: oklch(58% 0.18 25);
+  box-shadow: 0 0 0 2px oklch(96% 0.04 25);
+`;
+
 function ResponseNode({ data }) {
+  const outcomeClass = data.outcome === 'win' ? responseNodeWinClass : data.outcome === 'loss' ? responseNodeLossClass : '';
   return (
-    <div className={messagesNodeClass} style={{ transform: 'translateY(-50%)', position: 'relative' }}>
+    <div className={`${messagesNodeClass} ${outcomeClass}`} style={{ transform: 'translateY(-50%)', position: 'relative' }}>
       <div className={roleClass}>LLM · Response</div>
       {data.response == null ? (
         <div className={messageRowClass} style={{ color: 'var(--ink-4)', fontStyle: 'italic' }}>pending</div>
@@ -833,8 +843,15 @@ function FlowPanel({ sim, trace, stepIdx, setStepIdx, logsView }) {
     const out = span.attributes?.['cts.output'];
     if (typeof out === 'string') { currentResponse = out; break; }
   }
-  const turnsAttr = scopedSpans.find((s) => typeof s.attributes?.['cts.turns'] === 'number')?.attributes?.['cts.turns'] ?? 5;
+  const gameSpan = scopedSpans.find((s) => s.name === 'cts.game');
+  const turnsAttr = typeof gameSpan?.attributes?.['cts.turns'] === 'number' ? gameSpan.attributes['cts.turns'] : 5;
+  const targetStr = typeof gameSpan?.attributes?.['cts.target'] === 'string' ? gameSpan.attributes['cts.target'] : null;
   const turnRows = Array.from({ length: turnsAttr }, (_, i) => i);
+  let responseOutcome = null;
+  if (currentResponse != null && targetStr != null) {
+    if (currentResponse === targetStr) responseOutcome = 'win';
+    else if (activeTurn === turnsAttr - 1) responseOutcome = 'loss';
+  }
   const fromName = currentSpan?.attributes?.['chat.from'];
   const toName = currentSpan?.attributes?.['chat.to'];
   const currentSend = currentSpan && fromName && toName ? { from: fromName, to: toName, type: currentSpan.name, at: currentEvent.timeMs } : null;
@@ -859,7 +876,7 @@ function FlowPanel({ sim, trace, stepIdx, setStepIdx, logsView }) {
     id: 'LLM',
     type: 'response',
     position: { x: 460, y: 180 },
-    data: { response: currentResponse },
+    data: { response: currentResponse, outcome: responseOutcome },
     style: { background: 'transparent', border: 'none', padding: 0, width: 'auto' },
     draggable: false,
     selectable: false,
