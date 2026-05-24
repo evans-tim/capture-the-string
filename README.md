@@ -23,4 +23,4 @@ Each turn the User service sends the LLM:
 
 The LLM (`gpt-4o-mini`) returns one message. User checks exact equality against the target, appends the output to the transcript, and continues or stops.
 
-User and LLM are two services in a message-passing simulation. Traces are OpenTelemetry spans (`cts.game`, `cts.turn`, `cts.response`). The UI shows the game board, a step-through service-flow view, and a trace log.
+User and LLM are two services in a message-passing simulation. Traces are OpenTelemetry spans (`cts.game`, `cts.turn`, `cts.response`). The UI shows the game initialization options, a step-through game board view, and a trace log.
