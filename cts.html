@@ -1163,9 +1163,9 @@ function LogsPanel({ trace, view, onViewChange, stepIdx }) {
 
 
 function GamePanel({ sim, trace }) {
-  const [target, setTarget] = useState('hello world');
-  const [seedPrompt, setSeedPrompt] = useState('Output only the target string, nothing else.');
-  const [turns, setTurns] = useState(5);
+  const [target, setTarget] = useState('hello world!');
+  const [seedPrompt, setSeedPrompt] = useState('Output only the target string, nothing else. The target is the first message a programmer would expect to print. You must not answer the same thing twice, try different answers each time because the target might have capitalization AND/OR punctuation differences. The phrase will be as expected. If you get asked again that means you got it wrong.');
+  const [turns, setTurns] = useState(12);
   const [hideTarget, setHideTarget] = useState(false);
 
   const lastUserState = [...trace].reverse().find(
