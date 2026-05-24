@@ -1,4 +1,6 @@
-Capture the String (CTS) is a single-player LLM eval game. We start with the single-player case: turn minimization problem with no opponent. The "player" is just a single LLM. 
+Capture the String (CTS) is a single-player LLM eval game. We start with the single-player case: turn minimization problem with no opponent. The "player" is just a single LLM.
+
+<video src="assets/single_player_cts_example.mp4" controls width="600"></video>
 
 A fixed target string and turn budget are set before play. Each turn the player emits one message; prior messages accumulate as context. Payoff is +1 or -1.
 
